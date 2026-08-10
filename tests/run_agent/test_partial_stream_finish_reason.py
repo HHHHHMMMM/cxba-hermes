@@ -284,7 +284,8 @@ class TestLengthContinuationPromptBranching:
 
     def test_partial_stream_stub_uses_network_prompt(self):
         prompt = self._simulate_branch(PARTIAL_STREAM_STUB_ID)
-        assert "network error mid-stream" in prompt
+        assert "provider stream was interrupted" in prompt
+        assert "incomplete assistant response was discarded" in prompt
         assert "output length limit" not in prompt
 
 
@@ -323,13 +324,13 @@ def loop_agent():
 
 class TestConversationLoopPartialStreamContinuation:
     """End-to-end: a partial-stream stub feeds the loop and the loop
-    asks for continuation instead of exiting with finish_reason=stop."""
+    asks for state-based recovery instead of exiting with finish_reason=stop."""
 
     def test_partial_stream_stub_does_not_exit_loop_immediately(self, loop_agent):
         """The stub from chat_completion_helpers used to exit the loop with
         text_response(finish_reason=stop). Now finish_reason=length routes
-        through length_continue_retries — the loop persists the partial
-        content and asks the model to continue."""
+        through length_continue_retries — the loop discards the incomplete
+        response and asks the model to recover from durable state."""
 
         from tests.run_agent.test_run_agent import _mock_response, _mock_assistant_msg
 
@@ -375,14 +376,15 @@ class TestConversationLoopPartialStreamContinuation:
             (m for m in reversed(msgs) if m.get("role") == "user"), None,
         )
         assert last_user is not None
-        assert "network error mid-stream" in (last_user.get("content") or ""), (
-            "Continuation prompt for partial-stream-stub must mention the "
-            "network error, not the 'output length limit'."
+        assert "provider stream was interrupted" in (last_user.get("content") or ""), (
+            "Continuation prompt for partial-stream-stub must identify the "
+            "interrupted stream, not the 'output length limit'."
         )
 
-        # And the final response stitches both halves together.
-        assert "first half of" in result["final_response"]
-        assert "forty-two" in result["final_response"]
+        # The interrupted fragment is discarded; only the recovered response
+        # may become the final answer.
+        assert "first half of" not in result["final_response"]
+        assert result["final_response"] == "the answer is forty-two."
 
 
 class TestContentFilterStallActivatesFallback:
@@ -568,8 +570,10 @@ class TestEmptyPartialStreamStubNotPersisted:
             (m for m in reversed(msgs) if m.get("role") == "user"), None,
         )
         assert last_user is not None
-        assert "too large" in (last_user.get("content") or "")
-        assert "output length limit" not in (last_user.get("content") or "")
+        prompt = last_user.get("content") or ""
+        assert "interrupted while preparing a tool call (write_file)" in prompt
+        assert "issue a fresh, smaller call" in prompt
+        assert "output length limit" not in prompt
 
         assert result["completed"] is True
 

@@ -231,13 +231,23 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
             "drain-b",
             "sid",
             "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
+            {
+                "image_paths": ["/tmp/b.png"],
+                "queued_prompt_generation": 0,
+                "trusted_run_context": None,
+                "consumes_cxba_approvals": False,
+            },
         ),
         (
             "drain-c",
             "sid",
             "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
+            {
+                "image_paths": ["/tmp/c.png"],
+                "queued_prompt_generation": 0,
+                "trusted_run_context": None,
+                "consumes_cxba_approvals": False,
+            },
         ),
     ]
 
@@ -357,5 +367,4 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-
 

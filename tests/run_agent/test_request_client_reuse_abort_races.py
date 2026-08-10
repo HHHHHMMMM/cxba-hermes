@@ -251,9 +251,9 @@ def test_stale_abort_is_atomic_with_holder_read(monkeypatch):
     # ...and the worker's own finally still performed its close afterwards.
     # The stale kill cancels the stream attempt before aborting, so the
     # worker's late clean finish is treated as a superseded stream and the
-    # finally reports the error-cleanup reason — really closing the
+    # finally reports the partial-stream recovery reason — really closing the
     # socket-aborted (poisoned) client instead of caching it for reuse.
-    assert worker_close_reasons == ["stream_error_cleanup"]
+    assert worker_close_reasons == ["partial_stream_recovery_cleanup"]
 
 
 def test_direct_api_call_abort_is_atomic_with_holder_read():
