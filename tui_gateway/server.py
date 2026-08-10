@@ -9,13 +9,14 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
@@ -1030,6 +1031,31 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
         return True
 
 
+def _cxba_run_has_background_work(run_id: str, sid: str, session: dict) -> bool:
+    """Keep one Run sandbox while its native background work is still owned."""
+    from tools.async_delegation import has_live_for_session
+    from tools.process_registry import process_registry
+
+    own_sid, owned_session_key = _session_async_delegation_selectors(
+        session, sid_hint=sid
+    )
+    if has_live_for_session(
+        session_key=owned_session_key,
+        origin_ui_session_id=own_sid,
+    ):
+        return True
+    if process_registry.has_active_processes(run_id):
+        return True
+    queue = process_registry.completion_queue
+    with queue.mutex:
+        pending = list(queue.queue)
+    return any(
+        isinstance(event, dict)
+        and _session_owns_notification_event(sid, session, event)
+        for event in pending
+    )
+
+
 def _schedule_ws_orphan_reap(sid: str) -> None:
     """After a grace window, reap session ``sid`` iff it's still orphaned.
 
@@ -1571,7 +1597,28 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+    event_payload = dict(payload or {})
+    from tui_gateway.cxba_runtime import add_event, run_for_session
+
+    run = run_for_session(sid)
+    if run is not None:
+        try:
+            buffered = add_event(run.run_id, event, event_payload)
+            if buffered is not None:
+                event_payload["run_id"] = buffered["run_id"]
+                event_payload["event_id"] = buffered["event_id"]
+                event_payload["occurred_at"] = buffered["occurred_at"]
+                event_payload["stored_session_id"] = buffered["stored_session_id"]
+                event_payload["runtime_session_id"] = buffered["runtime_session_id"]
+        except Exception as exc:
+            logger.error(
+                "event=cxba_run_event stage=journal status=failed runId=%s eventType=%s",
+                run.run_id,
+                event,
+                exc_info=True,
+            )
+            raise RuntimeError("CXBA Run event journal write failed") from exc
+    write_json(_event_frame(event, sid, event_payload if event_payload else None))
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -1652,11 +1699,19 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
     with _compute_host_supervisor_lock:
         if _compute_host_supervisor is None:
             from tui_gateway.host_supervisor import HostSupervisor
+            from hermes_cli.config import load_config
+
+            full_cfg = load_config()
+            gateway_cfg = full_cfg.get("gateway") if isinstance(full_cfg, dict) else None
+            redact_child_stderr = bool(
+                isinstance(gateway_cfg, dict) and gateway_cfg.get("cxba_private_ws")
+            )
 
             _compute_host_supervisor = HostSupervisor(
                 rpc_sink=write_json,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
+                redact_child_stderr=redact_child_stderr,
             )
         return _compute_host_supervisor
 
@@ -1931,6 +1986,22 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    session_id = str(params.get("session_id") or "")
+    if session_id:
+        try:
+            with _sessions_lock:
+                live_session = _sessions.get(session_id)
+        except (AttributeError, RuntimeError):
+            live_session = None
+        if live_session is not None and live_session.get("cxba_binding") is not None:
+            from tui_gateway.transport import has_cxba_private_authority
+
+            if not has_cxba_private_authority():
+                return _err(
+                    rid,
+                    4035,
+                    "CXBA-bound Session requires a trusted private connection",
+                )
     return fn(rid, params)
 
 
@@ -2290,6 +2361,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+                session_still_live = _sessions.get(sid) is current
+            if not session_still_live:
+                return
             _notify_session_boundary("on_session_reset", key, _session_source(current))
 
             info = _session_info(agent, current)
@@ -2361,6 +2435,14 @@ def _sess(params, rid):
         return (None, err)
     _start_agent_build(params.get("session_id") or "", s)
     return (s, _wait_agent(s, rid))
+
+
+def _require_cxba_private(rid):
+    from tui_gateway.transport import has_cxba_private_authority
+
+    if not has_cxba_private_authority():
+        return _err(rid, 4039, "operation requires a trusted CXBA private connection")
+    return None
 
 
 def _normalize_completion_path(path_part: str) -> str:
@@ -2780,6 +2862,8 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    if session.get("cxba_binding") is not None:
+        model_config["_cxba_binding"] = copy.deepcopy(session["cxba_binding"])
     try:
         db.create_session(
             key,
@@ -4163,6 +4247,18 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
         if item.strip()
     ]
+    behavioral_cfg = _load_cfg()
+    gateway_cfg = behavioral_cfg.get("gateway") if isinstance(behavioral_cfg, dict) else None
+    cxba_private_ws = (
+        gateway_cfg.get("cxba_private_ws") if isinstance(gateway_cfg, dict) else None
+    )
+    if isinstance(cxba_private_ws, dict) and explicit:
+        print(
+            "[tui] ignoring HERMES_TUI_TOOLSETS override for the CXBA production profile",
+            file=sys.stderr,
+            flush=True,
+        )
+        explicit = []
     cfg = None
     fallback_notice = None
 
@@ -5262,6 +5358,198 @@ def _tool_ctx(name: str, args: dict) -> str:
         return ""
 
 
+def _tool_material_reference(sid: str, args: dict) -> dict[str, str] | None:
+    """Resolve exactly one `/data` path against the trusted Spring catalog."""
+    session = _sessions.get(sid)
+    binding = session.get("cxba_binding") if isinstance(session, dict) else None
+    initial_context = (
+        binding.get("initial_context") if isinstance(binding, dict) else None
+    )
+    catalog = (
+        initial_context.get("material_catalog")
+        if isinstance(initial_context, dict)
+        else None
+    )
+    if not isinstance(catalog, list):
+        return None
+
+    def argument_strings(value: object):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for nested in value.values():
+                yield from argument_strings(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from argument_strings(nested)
+
+    argument_values = tuple(argument_strings(args or {}))
+    matches: list[dict[str, str]] = []
+    for item in catalog:
+        if not isinstance(item, dict):
+            continue
+        material_id = str(
+            item.get("material_id") or item.get("materialId") or ""
+        ).strip()
+        relative_path = str(
+            item.get("relative_path") or item.get("relativePath") or ""
+        ).strip().replace("\\", "/")
+        path_parts = tuple(part for part in relative_path.split("/") if part)
+        if (
+            not material_id
+            or not relative_path
+            or relative_path.startswith("/")
+            or ".." in path_parts
+        ):
+            continue
+        mounted_path = f"/data/{relative_path}"
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9._/-]){re.escape(mounted_path)}"
+            rf"(?![A-Za-z0-9._/-])"
+        )
+        if any(value == mounted_path or pattern.search(value) for value in argument_values):
+            matches.append(
+                {"material_id": material_id, "relative_path": relative_path}
+            )
+
+    unique = {
+        (match["material_id"], match["relative_path"]): match for match in matches
+    }
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+_CXBA_FILE_OBSERVATION_TOOLS = frozenset(
+    {"write_file", "patch", "terminal", "execute_code"}
+)
+
+
+def _cxba_writable_file_snapshot(
+    sid: str,
+) -> dict[str, tuple[int, int, int, int, int]]:
+    """Observe actual files under this Run's writable mounts.
+
+    The transient stat tuple is only used to compare two local observations;
+    it is never exposed as a business version or persisted in an event.
+    """
+    from tui_gateway.cxba_runtime import run_for_session
+
+    run = run_for_session(sid)
+    if run is None:
+        return {}
+    snapshot: dict[str, tuple[int, int, int, int, int]] = {}
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for mount in run.context.mounts:
+        if mount.read_only or mount.target not in {"/workspace", "/exchange/current"}:
+            continue
+        root = Path(mount.source).resolve(strict=True)
+        visible_root = PurePosixPath(mount.target)
+        for current, directories, filenames in os.walk(
+            root, topdown=True, onerror=raise_walk_error, followlinks=False
+        ):
+            current_path = Path(current)
+            directories[:] = [
+                name for name in directories if not (current_path / name).is_symlink()
+            ]
+            for filename in filenames:
+                host_path = current_path / filename
+                state = host_path.lstat()
+                relative = host_path.relative_to(root)
+                visible_path = str(visible_root.joinpath(*relative.parts))
+                snapshot[visible_path] = (
+                    state.st_dev,
+                    state.st_ino,
+                    state.st_size,
+                    state.st_mtime_ns,
+                    state.st_mode,
+                )
+    return snapshot
+
+
+def _cxba_file_changes(
+    before: dict[str, tuple[int, int, int, int, int]],
+    after: dict[str, tuple[int, int, int, int, int]],
+) -> list[dict[str, str]]:
+    """Return real create/modify/move/delete changes between two observations."""
+    deleted = set(before) - set(after)
+    created = set(after) - set(before)
+    changes: list[dict[str, str]] = []
+
+    deleted_by_identity: dict[tuple[int, int], list[str]] = {}
+    created_by_identity: dict[tuple[int, int], list[str]] = {}
+    for path in deleted:
+        deleted_by_identity.setdefault(before[path][:2], []).append(path)
+    for path in created:
+        created_by_identity.setdefault(after[path][:2], []).append(path)
+    for identity in sorted(set(deleted_by_identity) & set(created_by_identity)):
+        old_paths = deleted_by_identity[identity]
+        new_paths = created_by_identity[identity]
+        if len(old_paths) != 1 or len(new_paths) != 1:
+            continue
+        previous_path = old_paths[0]
+        path = new_paths[0]
+        deleted.remove(previous_path)
+        created.remove(path)
+        changes.append(
+            {
+                "path": path,
+                "change_type": "MOVED",
+                "previous_path": previous_path,
+            }
+        )
+
+    changes.extend(
+        {"path": path, "change_type": "DELETED"} for path in sorted(deleted)
+    )
+    changes.extend(
+        {"path": path, "change_type": "CREATED"} for path in sorted(created)
+    )
+    changes.extend(
+        {"path": path, "change_type": "MODIFIED"}
+        for path in sorted(set(before) & set(after))
+        if before[path][2:] != after[path][2:]
+    )
+    return changes
+
+
+def _observe_cxba_files_before_tool(sid: str, session: dict, name: str) -> None:
+    if name not in _CXBA_FILE_OBSERVATION_TOOLS:
+        return
+    from tui_gateway.cxba_runtime import run_for_session
+
+    run = run_for_session(sid)
+    if run is None:
+        return
+    observation = session.get("cxba_file_observation")
+    if not isinstance(observation, dict) or observation.get("run_id") != run.run_id:
+        observation = {
+            "run_id": run.run_id,
+            "lock": threading.Lock(),
+            "snapshot": None,
+        }
+        session["cxba_file_observation"] = observation
+    with observation["lock"]:
+        if observation["snapshot"] is None:
+            observation["snapshot"] = _cxba_writable_file_snapshot(sid)
+
+
+def _emit_cxba_file_changes_after_tool(sid: str, session: dict, name: str) -> None:
+    if name not in _CXBA_FILE_OBSERVATION_TOOLS:
+        return
+    observation = session.get("cxba_file_observation")
+    if not isinstance(observation, dict) or observation.get("snapshot") is None:
+        return
+    with observation["lock"]:
+        before = observation["snapshot"]
+        after = _cxba_writable_file_snapshot(sid)
+        observation["snapshot"] = after
+        changes = _cxba_file_changes(before, after)
+    for change in changes:
+        _emit("file.changed", sid, change)
+
+
 def _emit_session_info_for_session(sid: str, session: dict) -> None:
     agent = session.get("agent")
     if agent is None and not _metadata_mirror(session):
@@ -5347,6 +5635,12 @@ def _tool_result_text(result: object) -> str:
     return _redact_tui_verbose_text(raw)
 
 
+def _is_cxba_run_session(sid: str) -> bool:
+    from tui_gateway.cxba_runtime import run_for_session
+
+    return run_for_session(sid) is not None
+
+
 def _fmt_tool_duration(seconds: float | None) -> str:
     if seconds is None:
         return ""
@@ -5407,7 +5701,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
-    if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
+        if _is_cxba_run_session(sid):
+            _observe_cxba_files_before_tool(sid, session, name)
+    if (
+        _tool_progress_enabled(sid)
+        or _tool_lifecycle_required_for_ui(name)
+        or _is_cxba_run_session(sid)
+    ):
         payload = {
             "tool_id": tool_call_id,
             "name": name,
@@ -5420,10 +5720,54 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         # tool.complete is the source of truth for todos (full list from the
         # tool result). args.todos here may be a partial merge update.
         _emit("tool.start", sid, payload)
+    from tui_gateway.cxba_runtime import run_for_session
+
+    run = run_for_session(sid)
+    if run is not None:
+        material_reference = _tool_material_reference(sid, args)
+        if material_reference is not None:
+            # This is an authoritative Case timeline event.  Let journal
+            # failures propagate instead of reporting a tool start while
+            # silently losing its material-access event.
+            _emit(
+                "material.access.start",
+                sid,
+                {
+                    "tool_id": tool_call_id,
+                    "name": name,
+                    **material_reference,
+                    "status": "READING",
+                },
+            )
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
+    complete_result_path = None
+    if _is_cxba_run_session(sid) and len(result) > 48_000:
+        try:
+            from tools.run_sandbox import (
+                workspace_output_directory,
+                workspace_visible_output_path,
+            )
+            from tui_gateway.cxba_runtime import run_for_session
+
+            active_run = run_for_session(sid)
+            output_dir = workspace_output_directory(active_run.run_id) if active_run else None
+            if output_dir is not None:
+                safe_tool_id = "".join(
+                    char if char.isalnum() or char in "._-" else "_"
+                    for char in tool_call_id
+                )[:160]
+                host_path = output_dir / f"tool-{safe_tool_id or 'result'}.txt"
+                host_path.write_text(result, encoding="utf-8", errors="replace")
+                complete_result_path = workspace_visible_output_path(
+                    active_run.run_id, str(host_path)
+                )
+        except Exception:
+            logger.exception(
+                "event=tool_result stage=persist status=failed toolCallId=%s", tool_call_id
+            )
     session = _sessions.get(sid)
     snapshot = None
     started_at = None
@@ -5433,10 +5777,17 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
-    try:
-        payload["result"] = json.loads(result)
-    except Exception:
-        payload["result"] = result
+    if complete_result_path:
+        payload["result"] = {
+            "summary": _tool_result_text(result),
+            "complete_result_path": complete_result_path,
+            "complete_result_chars": len(result),
+        }
+    else:
+        try:
+            payload["result"] = json.loads(result)
+        except Exception:
+            payload["result"] = result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
@@ -5465,8 +5816,48 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
-    if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
+    if (
+        _tool_progress_enabled(sid)
+        or payload.get("inline_diff")
+        or _tool_lifecycle_required_for_ui(name)
+        or _is_cxba_run_session(sid)
+    ):
         _emit("tool.complete", sid, payload)
+    from tui_gateway.cxba_runtime import observe_tool_result, run_for_session
+
+    run = run_for_session(sid)
+    if run is not None:
+        proposal_id = observe_tool_result(run.run_id, result)
+        if proposal_id:
+            # A proposal does not make the Run idle.  WAITING_APPROVAL is
+            # emitted only by the turn finalizer once Hermes has actually
+            # stopped doing read-only work.
+            _emit(
+                "approval.requested",
+                sid,
+                {"proposal_id": proposal_id, "status": "PENDING_APPROVAL"},
+            )
+        material_reference = _tool_material_reference(sid, args)
+        if material_reference is not None:
+            from agent.display import _detect_tool_failure
+
+            material_failed, _failure_reason = _detect_tool_failure(name, result)
+            _emit(
+                (
+                    "material.access.failed"
+                    if material_failed
+                    else "material.access.complete"
+                ),
+                sid,
+                {
+                    "tool_id": tool_call_id,
+                    "name": name,
+                    **material_reference,
+                    "status": "FAILED" if material_failed else "READ",
+                },
+            )
+        if session is not None:
+            _emit_cxba_file_changes_after_tool(sid, session, name)
 
 
 def _on_tool_progress(
@@ -5711,8 +6102,27 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _on_agent_event(sid: str, event_type: object, payload: object) -> None:
+    normalized_type = str(event_type)
+    normalized_payload = payload if isinstance(payload, dict) else {}
+    if normalized_type == "session:compress" and not normalized_payload.get("in_place"):
+        from tui_gateway.cxba_runtime import update_stored_session_mapping
+
+        mapping = update_stored_session_mapping(
+            sid,
+            old_session_id=str(normalized_payload.get("old_session_id") or ""),
+            new_session_id=str(normalized_payload.get("session_id") or ""),
+        )
+        if mapping is not None:
+            _emit("session.mapping_changed", sid, mapping)
+    _emit(normalized_type, sid, normalized_payload)
+
+
 def _agent_cbs(sid: str) -> dict:
     callbacks = {
+        "event_callback": lambda event_type, payload: _on_agent_event(
+            sid, event_type, payload
+        ),
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
             sid, tc_id, name, args
         ),
@@ -6440,6 +6850,25 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    try:
+        from tui_gateway.cxba_runtime import (
+            binding_from_model_config,
+            binding_system_context,
+        )
+
+        cxba_binding = (_sessions.get(sid) or {}).get("cxba_binding")
+        if cxba_binding is None and session_db is not None:
+            stored = session_db.get_session(session_id or key)
+            if stored:
+                cxba_binding = binding_from_model_config(stored.get("model_config"))
+        trusted_context = binding_system_context(cxba_binding)
+        if trusted_context:
+            system_prompt = "\n\n".join(
+                part for part in (system_prompt, trusted_context) if part
+            )
+    except Exception:
+        logger.exception("event=cxba_context stage=build status=failed sessionId=%s", key)
+        raise
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -6534,7 +6963,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6581,6 +7010,14 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if cxba_binding is not None:
+        agent._session_init_model_config = dict(
+            getattr(agent, "_session_init_model_config", None) or {}
+        )
+        agent._session_init_model_config["_cxba_binding"] = copy.deepcopy(
+            cxba_binding
+        )
+    return agent
 
 
 def _init_session(
@@ -7042,11 +7479,13 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(
+    history: list[dict], *, include_raw_indexes: bool = False
+) -> list[dict]:
     messages = []
     tool_call_args = {}
 
-    for m in history:
+    for raw_message_index, m in enumerate(history):
         if not isinstance(m, dict):
             continue
         role = m.get("role")
@@ -7102,6 +7541,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}
+        if include_raw_indexes:
+            msg["raw_message_index"] = raw_message_index
         # Durable row identity, stamped by _rows_to_conversation. The renderer's
         # own message ids are ephemeral (timestamp+index derived, and a
         # different shape for live vs rehydrated vs optimistic rows), so
@@ -7431,7 +7872,9 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
-) -> None:
+    trusted_run_context: Any = None,
+    consumes_cxba_approvals: bool = False,
+) -> bool:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
@@ -7443,6 +7886,10 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
+    if trusted_run_context is not None:
+        queued["trusted_run_context"] = trusted_run_context
+    if consumes_cxba_approvals:
+        queued["consumes_cxba_approvals"] = True
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7452,6 +7899,9 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and existing.get("trusted_run_context") is trusted_run_context
+        and bool(existing.get("consumes_cxba_approvals"))
+        == bool(consumes_cxba_approvals)
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -7499,7 +7949,8 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
+    trusted_run_context: Any = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7572,7 +8023,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            trusted_run_context=trusted_run_context,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7638,6 +8095,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    trusted_run_context=queued.get("trusted_run_context"),
+                    consumes_cxba_approvals=bool(
+                        queued.get("consumes_cxba_approvals")
+                    ),
                 )
             else:
                 _run_prompt_submit(
@@ -7646,6 +8107,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    trusted_run_context=queued.get("trusted_run_context"),
+                    consumes_cxba_approvals=bool(
+                        queued.get("consumes_cxba_approvals")
+                    ),
                 )
     except Exception as exc:
         print(
@@ -8093,7 +8558,9 @@ def _live_session_payload(
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages": [] if omit_messages else _history_to_messages(
+            history, include_raw_indexes=session.get("cxba_binding") is not None
+        ),
         "messages_omitted": omit_messages,
         "running": running,
         "session_id": sid,
@@ -8924,6 +9391,31 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _cxba_notification_belongs_to_active_run(session: dict, evt: dict) -> bool:
+    """Reject a late background result after its CXBA Run has terminated."""
+    run_id = str(evt.get("origin_cxba_run_id") or "")
+    if not run_id:
+        return True
+    if str(session.get("active_cxba_run_id") or "") != run_id:
+        return False
+    try:
+        from tui_gateway.cxba_runtime import get_run
+
+        run = get_run(run_id)
+    except Exception:
+        logger.error(
+            "event=cxba_background_notification stage=resolve status=failed runId=%s",
+            run_id,
+            exc_info=True,
+        )
+        return False
+    return bool(
+        run
+        and run.status
+        not in {"COMPLETED", "SAFE_STOPPED", "FORCE_STOPPED", "FAILED"}
+    )
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -9225,6 +9717,12 @@ def _notification_poller_loop(
                 sid,
             )
             continue
+        if not _cxba_notification_belongs_to_active_run(session, evt):
+            logger.info(
+                "event=cxba_background_notification stage=deliver status=dropped runId=%s",
+                str(evt.get("origin_cxba_run_id") or ""),
+            )
+            continue
 
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
@@ -9316,6 +9814,12 @@ def _notification_poller_loop(
                     str(evt.get("origin_ui_session_id") or ""),
                     str(evt.get("session_key") or ""),
                 )
+            continue
+        if not _cxba_notification_belongs_to_active_run(session, evt):
+            logger.info(
+                "event=cxba_background_notification stage=drain status=dropped runId=%s",
+                str(evt.get("origin_cxba_run_id") or ""),
+            )
             continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
@@ -9489,14 +9993,62 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-) -> None:
+    trusted_run_context=None,
+    consumes_cxba_approvals: bool = False,
+) -> bool:
+    if trusted_run_context is None:
+        active_run_id = str(session.get("active_cxba_run_id") or "")
+        if active_run_id:
+            from tui_gateway.cxba_runtime import get_run
+
+            active_run = get_run(active_run_id)
+            if active_run is not None and active_run.runtime_session_id == sid:
+                trusted_run_context = active_run.context
+    cxba_run = None
+    if trusted_run_context is not None:
+        try:
+            from tui_gateway.cxba_runtime import attach_run
+
+            cxba_run, created = attach_run(
+                run_context=trusted_run_context,
+                stored_session_id=str(session.get("session_key") or ""),
+                runtime_session_id=sid,
+            )
+            session["active_cxba_run_id"] = trusted_run_context.run_id
+            _emit(
+                "run.started" if created else "run.continued",
+                sid,
+                {"status": cxba_run.status},
+            )
+        except Exception as exc:
+            with session["history_lock"]:
+                session["running"] = False
+            _emit("error", sid, {"message": f"failed to attach trusted Run: {exc}"})
+            return False
+        try:
+            from tools.run_sandbox import register_run_sandbox
+            from tui_gateway.cxba_runtime import mark_sandbox_registered
+
+            if not cxba_run.sandbox_registered:
+                register_run_sandbox(trusted_run_context)
+                mark_sandbox_registered(trusted_run_context.run_id)
+                _emit("sandbox.started", sid, {"status": "RUNNING"})
+        except Exception as exc:
+            with session["history_lock"]:
+                session["running"] = False
+            _emit(
+                "error",
+                sid,
+                {"message": f"failed to register trusted Run sandbox: {exc}"},
+            )
+            return False
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
-            return
+            return False
         if image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
@@ -9528,12 +10080,15 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        history: list = []  # available even if setup fails before its snapshot
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        turn_failed = False
+        run_sandbox_binding = None
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -9547,6 +10102,13 @@ def _run_prompt_submit(
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
+            if trusted_run_context is not None:
+                from tools.run_sandbox import bind_run_sandbox
+
+                run_sandbox_binding = bind_run_sandbox(trusted_run_context.run_id)
+                run_sandbox_binding.__enter__()
+            if session.pop("_safe_stop_requested", False):
+                getattr(agent, "request_safe_stop", lambda: False)()
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
@@ -9791,7 +10353,11 @@ def _run_prompt_submit(
             except (TypeError, ValueError):
                 _run_params = {}
             if "task_id" in _run_params:
-                run_kwargs["task_id"] = session["session_key"]
+                run_kwargs["task_id"] = (
+                    trusted_run_context.run_id
+                    if trusted_run_context is not None
+                    else session["session_key"]
+                )
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -9937,6 +10503,7 @@ def _run_prompt_submit(
                 status = (
                     "interrupted"
                     if result.get("interrupted")
+                    else "safe_stopped" if result.get("safe_stopped")
                     else "error" if result.get("error") else "complete"
                 )
                 # When the backend produced no visible response AND reported a
@@ -9968,6 +10535,34 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if session.get("cxba_binding") is not None:
+                with session["history_lock"]:
+                    indexed_history = list(session.get("history", []))
+                for raw_index in range(len(indexed_history) - 1, -1, -1):
+                    if indexed_history[raw_index].get("role") == "assistant":
+                        payload["raw_message_index"] = raw_index
+                        break
+                for raw_index in range(len(indexed_history) - 1, -1, -1):
+                    if indexed_history[raw_index].get("role") == "user":
+                        payload["user_raw_message_index"] = raw_index
+                        break
+                locator_db = getattr(agent, "_session_db", None)
+                locator_session_id = getattr(agent, "session_id", None) or session.get(
+                    "session_key"
+                )
+                if locator_db is not None and locator_session_id:
+                    persisted_messages = locator_db.get_messages_as_conversation(
+                        locator_session_id,
+                        include_row_ids=True,
+                    )
+                    for persisted in reversed(persisted_messages):
+                        if persisted.get("role") == "assistant" and persisted.get("_row_id"):
+                            payload["message_row_id"] = persisted["_row_id"]
+                            break
+                    for persisted in reversed(persisted_messages):
+                        if persisted.get("role") == "user" and persisted.get("_row_id"):
+                            payload["user_message_row_id"] = persisted["_row_id"]
+                            break
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -9995,6 +10590,7 @@ def _run_prompt_submit(
                         result.get("error") if isinstance(result, dict) else raw,
                     )
                     turn_error_retained = True
+                    turn_failed = True
                 else:
                     _clear_inflight_turn(session)
             if status == "error":
@@ -10148,6 +10744,7 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            turn_failed = True
             import traceback
 
             trace = traceback.format_exc()
@@ -10230,6 +10827,176 @@ def _run_prompt_submit(
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
                 reset_secret_scope(secret_token)
+            if run_sandbox_binding is not None:
+                run_sandbox_binding.__exit__(None, None, None)
+            leftover_steer = (
+                result.get("pending_steer") if isinstance(result, dict) else None
+            )
+            leftover_queued = False
+            if isinstance(leftover_steer, str) and leftover_steer.strip():
+                approval_steer_pending = bool(
+                    session.pop("_cxba_approval_steer_pending", False)
+                )
+                with session["history_lock"]:
+                    _enqueue_prompt(
+                        session,
+                        leftover_steer,
+                        session.get("transport"),
+                        trusted_run_context=trusted_run_context,
+                        consumes_cxba_approvals=approval_steer_pending,
+                    )
+                leftover_queued = True
+            elif trusted_run_context is not None and (
+                consumes_cxba_approvals
+                or session.pop("_cxba_approval_steer_pending", False)
+            ):
+                try:
+                    from tui_gateway.cxba_runtime import drain_approval_events
+
+                    drain_approval_events(trusted_run_context.run_id)
+                except KeyError:
+                    pass
+            keep_run_sandbox = False
+            approval_pending = False
+            approval_delivery_pending = False
+            background_active = False
+            retention_probe_failed = False
+            if trusted_run_context is not None:
+                try:
+                    from tui_gateway.cxba_runtime import (
+                        has_pending_proposals,
+                        has_undelivered_approval_results,
+                        mark_waiting_approval,
+                        should_keep_sandbox,
+                    )
+
+                    keep_run_sandbox = should_keep_sandbox(
+                        trusted_run_context.run_id
+                    )
+                    approval_pending = has_pending_proposals(
+                        trusted_run_context.run_id
+                    )
+                    approval_delivery_pending = has_undelivered_approval_results(
+                        trusted_run_context.run_id
+                    )
+                    background_active = _cxba_run_has_background_work(
+                        trusted_run_context.run_id, sid, session
+                    )
+                    keep_run_sandbox = keep_run_sandbox or background_active
+                    if approval_pending:
+                        mark_waiting_approval(trusted_run_context.run_id)
+                except Exception as exc:
+                    retention_probe_failed = True
+                    keep_run_sandbox = True
+                    error_type = type(exc).__name__
+                    logger.error(
+                        "event=cxba_sandbox_retention stage=probe status=failed "
+                        "runId=%s errorType=%s",
+                        trusted_run_context.run_id,
+                        error_type,
+                        exc_info=True,
+                    )
+                    try:
+                        from tui_gateway.cxba_runtime import record_heartbeat
+
+                        changed, event_type = record_heartbeat(
+                            trusted_run_context.run_id, healthy=False
+                        )
+                        if changed and event_type:
+                            _emit(
+                                event_type,
+                                sid,
+                                {
+                                    "status": "UNREACHABLE",
+                                    "levels": {
+                                        "retention_probe": {
+                                            "status": "failed",
+                                            "error_type": error_type,
+                                        }
+                                    },
+                                },
+                            )
+                        _emit(
+                            "run.diagnostic",
+                            sid,
+                            {
+                                "status": "UNREACHABLE",
+                                "diagnostic": "sandbox_retention_probe_failed",
+                                "error_type": error_type,
+                            },
+                        )
+                    except Exception as diagnostic_exc:
+                        logger.error(
+                            "event=cxba_sandbox_retention stage=diagnostic "
+                            "status=failed runId=%s errorType=%s",
+                            trusted_run_context.run_id,
+                            type(diagnostic_exc).__name__,
+                            exc_info=True,
+                        )
+            if keep_run_sandbox:
+                if retention_probe_failed:
+                    pass
+                elif approval_pending:
+                    from tui_gateway.cxba_runtime import safe_stop_requested
+
+                    waiting_status = (
+                        "SAFE_STOPPING"
+                        if safe_stop_requested(trusted_run_context.run_id)
+                        else "WAITING_APPROVAL"
+                    )
+                    _emit("run.waiting_approval", sid, {"status": waiting_status})
+                elif approval_delivery_pending:
+                    from tui_gateway.cxba_runtime import safe_stop_requested
+
+                    _emit(
+                        "run.continuation_queued",
+                        sid,
+                        {
+                            "status": (
+                                "SAFE_STOPPING"
+                                if safe_stop_requested(trusted_run_context.run_id)
+                                else "RUNNING"
+                            ),
+                            "reason": "approval_result",
+                        },
+                    )
+                else:
+                    _emit("run.background", sid, {"status": "RUNNING"})
+            elif trusted_run_context is not None and cxba_run is not None and cxba_run.sandbox_registered:
+                try:
+                    from tools.run_sandbox import destroy_run_sandbox
+                    from tui_gateway.cxba_runtime import detach_completed_run
+
+                    destroy_run_sandbox(trusted_run_context.run_id)
+                    from tui_gateway.cxba_runtime import safe_stop_requested
+
+                    safe_stopped = bool(
+                        (isinstance(result, dict) and result.get("safe_stopped"))
+                        or safe_stop_requested(trusted_run_context.run_id)
+                    )
+                    terminal_status = (
+                        "SAFE_STOPPED"
+                        if safe_stopped
+                        else "FAILED" if turn_failed else "COMPLETED"
+                    )
+                    _emit("sandbox.stopped", sid, {"status": terminal_status})
+                    _emit(
+                        (
+                            "safe_stop.completed"
+                            if safe_stopped
+                            else "run.failed" if turn_failed else "run.completed"
+                        ),
+                        sid,
+                        {"status": terminal_status},
+                    )
+                    detach_completed_run(trusted_run_context.run_id, terminal_status)
+                    session.pop("active_cxba_run_id", None)
+                except Exception:
+                    logger.error(
+                        "event=run_sandbox stage=destroy status=failed runId=%s",
+                        trusted_run_context.run_id,
+                        exc_info=True,
+                    )
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)
@@ -10256,10 +11023,8 @@ def _run_prompt_submit(
         # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
         # A real queued prompt still wins: the merge in _enqueue_prompt keeps
         # both texts.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
-            with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+        if isinstance(result, dict) and result.get("safe_stopped"):
+            return
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -10345,6 +11110,7 @@ def _run_prompt_submit(
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
     run_thread.start()
+    return True
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25

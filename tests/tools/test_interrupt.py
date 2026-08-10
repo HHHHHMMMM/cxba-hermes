@@ -109,6 +109,37 @@ class TestPreToolCheck:
         # No actual tool handlers should have been called
         # (handle_function_call should NOT have been invoked)
 
+    def test_safe_stop_skips_new_tools_without_setting_hard_interrupt(self):
+        from unittest.mock import MagicMock
+
+        tool_call = MagicMock()
+        tool_call.id = "tc_safe"
+        tool_call.function.name = "terminal"
+        tool_call.function.arguments = '{"command": "echo should-not-run"}'
+        assistant_msg = MagicMock(tool_calls=[tool_call])
+        messages = []
+        agent = MagicMock()
+        agent._interrupt_requested = False
+        agent._incremental_persistence_failed = False
+        agent.log_prefix = ""
+        agent._safe_stop_requested = threading.Event()
+        agent._safe_stop_requested.set()
+
+        import types
+        from run_agent import AIAgent
+
+        agent._execute_tool_calls_sequential = types.MethodType(
+            AIAgent._execute_tool_calls_sequential, agent
+        )
+        agent._execute_tool_calls_concurrent = types.MethodType(
+            AIAgent._execute_tool_calls_concurrent, agent
+        )
+        AIAgent._execute_tool_calls(agent, assistant_msg, messages, "run-safe")
+
+        assert agent._interrupt_requested is False
+        assert len(messages) == 1
+        assert "safe stop" in messages[0]["content"].lower()
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: message combining

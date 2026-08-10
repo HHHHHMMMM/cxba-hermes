@@ -1,0 +1,1 @@
+../../../profiles/cxba-production/skills/cxba/cxba-safe-tabular-analysis/SKILL.md

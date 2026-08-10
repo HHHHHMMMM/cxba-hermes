@@ -3306,6 +3306,12 @@ def delegate_task(
         _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
     except Exception:
         _origin_ui_session_id = ""
+    try:
+        from tools.run_sandbox import current_run_sandbox_id
+
+        _origin_cxba_run_id = current_run_sandbox_id() or ""
+    except Exception:
+        _origin_cxba_run_id = ""
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
@@ -3734,6 +3740,7 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
+            origin_cxba_run_id=_origin_cxba_run_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

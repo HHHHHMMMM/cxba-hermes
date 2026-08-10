@@ -40,6 +40,7 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.stream_repetition_guard import RepetitiveStreamError, StreamRepetitionGuard
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -2637,7 +2638,21 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     idle sessions.
     """
     try:
-        if is_persistent_env(task_id):
+        cxba_runtime_owns_vm = False
+        try:
+            from tui_gateway.cxba_runtime import runtime_owns_sandbox
+
+            cxba_runtime_owns_vm = runtime_owns_sandbox(task_id)
+        except (ImportError, KeyError):
+            cxba_runtime_owns_vm = False
+        if cxba_runtime_owns_vm:
+            if agent.verbose_logging:
+                logging.debug(
+                    "Skipping per-turn cleanup_vm for CXBA Run %s; "
+                    "the Run lifecycle owns this sandbox.",
+                    task_id,
+                )
+        elif is_persistent_env(task_id):
             if agent.verbose_logging:
                 logging.debug(
                     f"Skipping per-turn cleanup_vm for persistent env {task_id}; "
@@ -3248,6 +3263,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        repetition_guard = StreamRepetitionGuard()
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -3445,6 +3461,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
+                repetition = repetition_guard.observe(delta.content)
+                if repetition is not None:
+                    logger.warning(
+                        "Degenerate repeated text detected in chat completion stream "
+                        "(line_length=%s repetitions=%s); closing stream.",
+                        repetition.line_length,
+                        repetition.repetitions,
+                    )
+                    _cancel_current_stream_attempt("repetitive_stream_output")
+                    _close_managed_stream()
+                    raise RepetitiveStreamError(
+                        "Provider stream produced excessive consecutive text repetition"
+                    )
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
                     _fire_first_delta()
@@ -4017,6 +4046,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
+                    if isinstance(e, RepetitiveStreamError):
+                        deltas_were_sent["yes"] = True
+                        _cancel_current_stream_attempt("repetitive_stream_output")
+                        _close_request_client_once("repetitive_stream_output")
+                        result["error"] = e
+                        return
+
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
                     # retrying would duplicate it).  BUT: if a tool call
@@ -4074,6 +4110,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # stub path.
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
+                            )
+                            _cancel_current_stream_attempt(
+                                "partial_stream_recovery_cleanup"
+                            )
+                            _close_request_client_once(
+                                "partial_stream_recovery_cleanup"
                             )
                             result["error"] = e
                             return

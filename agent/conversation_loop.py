@@ -750,24 +750,22 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
-            "[System: Your previous tool call "
-            f"({tool_list}) was too large and "
-            "the stream timed out before it "
-            "could be delivered. Do NOT retry "
-            "the same tool call with the same "
-            "large content. Instead, break the "
-            "content into multiple smaller tool "
-            "calls (e.g. use multiple patch calls "
-            "or write smaller files). Each tool "
-            "call's arguments must be under ~8K "
-            "tokens to avoid stream timeouts.]"
+            "[System: The provider stream was interrupted while preparing "
+            f"a tool call ({tool_list}). That incomplete response and tool "
+            "call were discarded and must not be continued. Resume as a new "
+            "action step: re-read the durable task state or checkpoint files "
+            "specified by the user or active skills, verify the last completed "
+            "tool result, and perform only the next required action. If the "
+            "same tool is still required, issue a fresh, smaller call.]"
         )
     elif is_partial_stub:
         return (
-            "[System: The previous response was cut off by a "
-            "network error mid-stream. Continue exactly where "
-            "you left off. Do not restart or repeat prior text. "
-            "Finish the answer directly.]"
+            "[System: The provider stream was interrupted. The incomplete "
+            "assistant response was discarded and must not be continued or "
+            "repeated. Resume as a new action step: re-read the durable task "
+            "state or checkpoint files specified by the user or active skills, "
+            "verify the last completed tool result, and perform only the next "
+            "required action. Do not restate the overall plan.]"
         )
     else:
         return (
@@ -3210,32 +3208,30 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
-                            # An EMPTY partial-stream stub (stream dropped
-                            # mid tool-call before any text was delivered)
-                            # must not be appended as an interim assistant
-                            # message: it would serialize as
-                            # {"role": "assistant", "content": ""}, and
-                            # strict providers (Moonshot/Kimi via OpenRouter)
-                            # reject empty assistant content with HTTP 400
-                            # ("message ... with role 'assistant' must not be
-                            # empty") on the very next replay — permanently
-                            # poisoning the session history.  There is no
-                            # partial text to continue from anyway, so only
-                            # the continuation user-message is appended.
-                            _is_empty_partial_stub = (
+                            _is_partial_stream_stub = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                and not getattr(assistant_message, "content", None)
                             )
-                            if not _is_empty_partial_stub:
+                            if _is_partial_stream_stub:
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": (
+                                        "The previous action was interrupted before completion; "
+                                        "its partial response was discarded."
+                                    ),
+                                    "_stream_recovery_synthetic": True,
+                                })
+                                if getattr(agent, "event_callback", None):
+                                    agent.event_callback(
+                                        "draft.discarded",
+                                        {"reason": "provider_stream_interrupted"},
+                                    )
+                            else:
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                                 messages.append(interim_msg)
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                )
                                 _dropped_tools = getattr(
                                     response, "_dropped_tool_names", None
                                 )
@@ -3244,14 +3240,14 @@ def run_conversation(
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Stream interrupted mid "
-                                        f"tool-call ({_tool_list}) — requesting "
-                                        f"chunked retry "
+                                        f"tool-call ({_tool_list}) — starting "
+                                        f"state-based recovery "
                                         f"({length_continue_retries}/4)..."
                                     )
                                 elif _is_partial_stream_stub:
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Stream interrupted — "
-                                        f"requesting continuation "
+                                        f"starting state-based recovery "
                                         f"({length_continue_retries}/4)..."
                                     )
                                 else:
@@ -3267,6 +3263,13 @@ def run_conversation(
                                     "role": "user",
                                     "content": _continue_content,
                                 }
+                                if _is_partial_stream_stub:
+                                    continue_msg["_stream_recovery_synthetic"] = True
+                                    if getattr(agent, "event_callback", None):
+                                        agent.event_callback(
+                                            "recovery.started",
+                                            {"reason": "provider_stream_interrupted"},
+                                        )
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
@@ -6549,6 +6552,16 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                _safe_stop_event = vars(agent).get("_safe_stop_requested")
+                if _safe_stop_event is not None and _safe_stop_event.is_set():
+                    # Tool results were flushed one-by-one by the executor.
+                    # Close the role sequence without another model/tool step.
+                    _turn_exit_reason = "safe_stop_after_tool"
+                    final_response = "Run stopped safely after the current tool completed."
+                    close_interrupted_tool_sequence(messages, final_response)
+                    agent._flush_messages_to_session_db(messages, conversation_history)
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

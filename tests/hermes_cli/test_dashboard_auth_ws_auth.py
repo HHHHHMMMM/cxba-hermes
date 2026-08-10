@@ -201,6 +201,18 @@ class TestWsAuthOkLoopback:
         assert web_server._ws_auth_ok(ws) is True
 
 
+def test_cxba_private_header_authenticates_gateway_without_dashboard_token(monkeypatch):
+    private_token = "p" * 32
+    monkeypatch.setenv("CXBA_GATEWAY_PRIVATE_TOKEN", private_token)
+    ws = _fake_ws(query={}, path="/api/ws")
+    ws.headers = {"x-cxba-gateway-token": private_token}
+
+    from tui_gateway.ws import _has_cxba_private_token
+
+    assert _has_cxba_private_token(ws) is True
+    assert web_server._ws_auth_ok(ws) is False
+
+
 class TestWsAuthOkGated:
     """Gate ON — ticket path only."""
 
@@ -426,4 +438,3 @@ class TestGatewayWsUrl:
         gw_cred = gw.split("internal=")[1].split("&")[0]
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
-

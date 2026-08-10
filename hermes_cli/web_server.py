@@ -15926,15 +15926,19 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    # Spring's CXBA control plane is not a dashboard browser and therefore
+    # does not possess the dashboard's ephemeral query token. Its dedicated
+    # private header is the complete credential for this one JSON-RPC socket;
+    # the ordinary dashboard token/ticket path remains unchanged.
+    from tui_gateway.ws import _has_cxba_private_token, handle_ws
+
+    if not (_has_cxba_private_token(ws) or _ws_auth_ok(ws)):
         await ws.close(code=4401)
         return
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
-
-    from tui_gateway.ws import handle_ws
 
     await handle_ws(ws)
 

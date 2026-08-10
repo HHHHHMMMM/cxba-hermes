@@ -13,6 +13,47 @@ _profile_scoped = _registry.profile_scoped
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    cxba_binding = None
+    if "cxba_context" in params:
+        from tui_gateway.transport import has_cxba_private_authority
+
+        if not has_cxba_private_authority():
+            return _err(rid, 4033, "cxba_context requires a trusted CXBA private connection")
+        try:
+            from tui_gateway.cxba_runtime import validate_session_binding
+
+            cxba_binding = validate_session_binding(params.get("cxba_context"))
+        except ValueError as exc:
+            return _err(rid, 4034, f"invalid trusted cxba_context: {exc}")
+        for live in _sessions.values():
+            live_binding = live.get("cxba_binding")
+            if (
+                isinstance(live_binding, dict)
+                and live_binding.get("business_session_id")
+                == cxba_binding["business_session_id"]
+                and live_binding.get("business_branch_id")
+                == cxba_binding["business_branch_id"]
+            ):
+                return _err(rid, 4092, "business branch is already bound")
+        with _profile_db(params) as binding_db:
+            if binding_db is None or not hasattr(binding_db, "list_sessions_rich"):
+                return _err(rid, 5008, "session store cannot verify business branch binding")
+            from tui_gateway.cxba_runtime import binding_from_model_config
+
+            for stored in binding_db.list_sessions_rich(
+                limit=10_000,
+                include_children=True,
+                include_archived=True,
+            ):
+                stored_binding = binding_from_model_config(stored.get("model_config"))
+                if (
+                    stored_binding is not None
+                    and stored_binding["business_session_id"]
+                    == cxba_binding["business_session_id"]
+                    and stored_binding["business_branch_id"]
+                    == cxba_binding["business_branch_id"]
+                ):
+                    return _err(rid, 4092, "business branch is already bound")
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -107,15 +148,31 @@ def _(rid, params: dict) -> dict:
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
+            "cxba_binding": cxba_binding,
         }
         _register_session_cwd(_sessions[sid])
 
-    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
-    # launch (and every "New agent" / draft) opens a session here just to paint
-    # the composer, so eagerly creating a row left an "Untitled" empty session
-    # behind for every launch the user never typed into. The row is now created
-    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
-    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+    # Ordinary Hermes drafts remain lazy so opening an unused composer does not
+    # leave an empty row.  A trusted CXBA create is different: Spring has already
+    # created a durable business branch and receives ``stored_session_id`` as its
+    # stable continuation handle.  Persist that empty row before acknowledging
+    # the create so close/reconnect can resume it even before the first prompt.
+    if cxba_binding is not None:
+        try:
+            _ensure_session_db_row(_sessions[sid])
+            with _profile_db(params) as cxba_db:
+                persisted = cxba_db.get_session(key) if cxba_db is not None else None
+            if persisted is None:
+                raise RuntimeError("trusted CXBA session row was not persisted")
+        except Exception:
+            logger.exception(
+                "event=cxba_session stage=create status=persist_failed sessionId=%s",
+                key,
+            )
+            with _sessions_lock:
+                failed_session = _sessions.pop(sid, None)
+            _teardown_popped_session(failed_session, end_reason="create_persist_failed")
+            return _err(rid, 5008, "trusted CXBA session could not be persisted")
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
@@ -130,7 +187,9 @@ def _(rid, params: dict) -> dict:
             "session_id": sid,
             "stored_session_id": key,
             "message_count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _history_to_messages(
+                history, include_raw_indexes=cxba_binding is not None
+            ),
             "info": {
                 # Reflect the per-session model override (desktop composer pick)
                 # in the immediate response so the client doesn't briefly clobber
@@ -161,6 +220,9 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
+    from tui_gateway.cxba_runtime import binding_from_model_config
+    from tui_gateway.transport import has_cxba_private_authority
+
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5006)
@@ -190,6 +252,10 @@ def _(rid, params: dict) -> dict:
                     compact_rows=True,
                 )
                 if (s.get("source") or "").strip().lower() not in deny
+                and (
+                    has_cxba_private_authority()
+                    or binding_from_model_config(s.get("model_config")) is None
+                )
             ][:limit]
             return _ok(
                 rid,
@@ -241,9 +307,17 @@ def _(rid, params: dict) -> dict:
             rows = db.list_sessions_rich(
                 source=None, limit=200, order_by_last_active=True, compact_rows=True
             )
+            from tui_gateway.cxba_runtime import binding_from_model_config
+            from tui_gateway.transport import has_cxba_private_authority
+
             for row in rows:
                 src = (row.get("source") or "").strip().lower()
                 if src in deny:
+                    continue
+                if (
+                    not has_cxba_private_authority()
+                    and binding_from_model_config(row.get("model_config")) is not None
+                ):
                     continue
                 return _ok(
                     rid,
@@ -358,6 +432,42 @@ def _(rid, params: dict) -> dict:
             else:
                 return _err(rid, 4007, "session not found")
 
+        from tui_gateway.cxba_runtime import binding_from_model_config, validate_session_binding
+        from tui_gateway.transport import has_cxba_private_authority
+
+        stored_cxba_binding = binding_from_model_config(found.get("model_config"))
+        raw_model_config = found.get("model_config")
+        if isinstance(raw_model_config, str):
+            try:
+                raw_model_config = json.loads(raw_model_config)
+            except (TypeError, ValueError):
+                raw_model_config = {}
+        if (
+            stored_cxba_binding is not None
+            and isinstance(raw_model_config, dict)
+            and raw_model_config.get("_cxba_retired") is True
+        ):
+            return _err(rid, 4100, "CXBA business Session is retired and cannot resume")
+        supplied_cxba_binding = None
+        if "cxba_context" in params:
+            if not has_cxba_private_authority():
+                return _err(
+                    rid, 4033, "cxba_context requires a trusted CXBA private connection"
+                )
+            try:
+                supplied_cxba_binding = validate_session_binding(params.get("cxba_context"))
+            except ValueError as exc:
+                return _err(rid, 4034, f"invalid trusted cxba_context: {exc}")
+        if stored_cxba_binding is not None:
+            if not has_cxba_private_authority():
+                return _err(rid, 4035, "CXBA session resume requires a trusted private connection")
+            if supplied_cxba_binding is not None and supplied_cxba_binding != stored_cxba_binding:
+                return _err(rid, 4036, "cxba_context does not match the stored session binding")
+        elif supplied_cxba_binding is not None:
+            return _err(
+                rid, 4036, "an existing Hermes session cannot acquire a CXBA binding on resume"
+            )
+
         # Follow the compression-continuation chain to the live tip so a resume on
         # a rotated-out parent id binds to the descendant that actually holds the
         # post-compression turns. Auto-compression ends the session and forks a
@@ -402,6 +512,16 @@ def _(rid, params: dict) -> dict:
 
         # Fast path: if the session is already live, reuse it under the lock.
         with _session_resume_lock:
+            if (
+                stored_cxba_binding is not None
+                and db.get_session_model_config_value(
+                    target, "_cxba_retired", False
+                )
+                is True
+            ):
+                return _err(
+                    rid, 4100, "CXBA business Session is retired and cannot resume"
+                )
             live = _find_live_session_by_key(target)
             if live is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -442,6 +562,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 lazy=True,
             )
+            record["cxba_binding"] = stored_cxba_binding
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
             # A delegated child mid-run emits no session events of its own — report
@@ -460,7 +581,9 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _history_to_messages(
+                display_history, include_raw_indexes=stored_cxba_binding is not None
+            )
             return _ok(
                 rid,
                 {
@@ -540,6 +663,7 @@ def _(rid, params: dict) -> dict:
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
             )
+            record["cxba_binding"] = stored_cxba_binding
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
 
@@ -547,7 +671,9 @@ def _(rid, params: dict) -> dict:
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _history_to_messages(
+                display_history, include_raw_indexes=stored_cxba_binding is not None
+            )
             payload = {
                 "session_id": sid,
                 "resumed": target,
@@ -609,7 +735,9 @@ def _(rid, params: dict) -> dict:
                 [] if omit_messages else db.get_ancestor_display_prefix(target)
             )
             history = sanitize_replay_history(raw_history)
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _history_to_messages(
+                display_history, include_raw_indexes=stored_cxba_binding is not None
+            )
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -642,13 +770,35 @@ def _(rid, params: dict) -> dict:
         # live session while we were building. Re-check under the lock; if it won,
         # discard our just-built agent and reuse theirs (no worker/poller wired yet).
         with _session_resume_lock:
+            if (
+                stored_cxba_binding is not None
+                and db.get_session_model_config_value(
+                    target, "_cxba_retired", False
+                )
+                is True
+            ):
+                try:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                finally:
+                    if lease is not None:
+                        lease.release()
+                return _err(
+                    rid, 4100, "CXBA business Session is retired and cannot resume"
+                )
             live = _find_live_session_by_key(target)
             if live is not None:
                 try:
                     if hasattr(agent, "close"):
                         agent.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if session.get("cxba_binding") is not None:
+                        return _err(
+                            rid,
+                            5008,
+                            f"trusted session history could not be loaded: {exc}",
+                        )
+                    logger.debug("session.history database lookup failed", exc_info=True)
                 if lease is not None:
                     lease.release()
                 other_sid, other_session = live
@@ -713,6 +863,7 @@ def _(rid, params: dict) -> dict:
                     if init_secret_token is not None:
                         reset_secret_scope(init_secret_token)
                 if sid in _sessions:
+                    _sessions[sid]["cxba_binding"] = stored_cxba_binding
                     if stored_runtime_overrides.get("model_override") is not None:
                         _sessions[sid]["model_override"] = stored_runtime_overrides[
                             "model_override"
@@ -905,10 +1056,16 @@ def _(rid, params: dict) -> dict:
     # Keep the natural creation/insertion order from ``_sessions``.  The
     # frontend marks the focused session with ``current``; it should not jump to
     # the top just because the user switched to it.
+    from tui_gateway.transport import has_cxba_private_authority
+
     rows = [
         _session_live_item(sid, session, current)
         for sid, session in snapshot
         if not session.get("_finalized")
+        and (
+            session.get("cxba_binding") is None
+            or has_cxba_private_authority()
+        )
     ]
     return _ok(rid, {"sessions": rows})
 
@@ -975,6 +1132,16 @@ def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)
+        stored = db.get_session(target) if hasattr(db, "get_session") else None
+        if stored is not None:
+            from tui_gateway.cxba_runtime import binding_from_model_config
+
+            if binding_from_model_config(stored.get("model_config")) is not None:
+                return _err(
+                    rid,
+                    4035,
+                    "CXBA Session history cannot be physically deleted; retire its runtime state",
+                )
         if profile_home is not None:
             sessions_dir = Path(profile_home) / "sessions"
         else:
@@ -1328,6 +1495,29 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if session.get("cxba_binding") is not None:
+        from tui_gateway.cxba_runtime import run_for_session
+
+        active_run = run_for_session(str(params.get("session_id") or ""))
+        if active_run is None or active_run.status in {
+            "COMPLETED", "SAFE_STOPPED", "FORCE_STOPPED", "FAILED"
+        }:
+            return _err(rid, 4095, "CXBA Run is no longer active")
+        if active_run.status == "SAFE_STOPPING":
+            return _err(rid, 4094, "Run is safe-stopping")
+        if not session.get("running"):
+            with session["history_lock"]:
+                if session.get("running"):
+                    return _err(rid, 4009, "session became busy")
+                session["running"] = True
+            _run_prompt_submit(
+                rid,
+                str(params.get("session_id") or ""),
+                session,
+                text,
+                trusted_run_context=active_run.context,
+            )
+            return _ok(rid, {"status": "continuing", "text": text})
     agent = session.get("agent")
     usage: dict = _session_usage_snapshot(session)
     if agent is None and not usage:
@@ -1352,6 +1542,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if session.get("cxba_binding") is not None:
+        from tui_gateway.cxba_runtime import run_for_session
+
+        active_run = run_for_session(str(params.get("session_id") or ""))
+        if active_run is None or active_run.status in {
+            "COMPLETED", "SAFE_STOPPED", "FORCE_STOPPED", "FAILED"
+        }:
+            return _err(rid, 4095, "CXBA Run is no longer active")
+        if active_run.status == "SAFE_STOPPING":
+            return _err(rid, 4094, "Run is safe-stopping")
     agent = session.get("agent")
     if agent is None:
         usage = _session_usage_snapshot(session) or _get_usage(None)
@@ -2419,15 +2619,26 @@ def _(rid, params: dict) -> dict:
             if db is not None:
                 try:
                     history = db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True
+                        session["session_key"],
+                        include_ancestors=True,
+                        include_inactive=session.get("cxba_binding") is not None,
+                        include_row_ids=session.get("cxba_binding") is not None,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if session.get("cxba_binding") is not None:
+                        return _err(
+                            rid,
+                            5008,
+                            f"trusted session history could not be loaded: {exc}",
+                        )
+                    logger.debug("session.history database lookup failed", exc_info=True)
     return _ok(
         rid,
         {
             "count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _history_to_messages(
+                history, include_raw_indexes=session.get("cxba_binding") is not None
+            ),
         },
     )
 
@@ -2731,8 +2942,48 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    parent_cxba_binding = session.get("cxba_binding")
+    branch_cxba_binding = None
+    if parent_cxba_binding is not None:
+        from tui_gateway.transport import has_cxba_private_authority
+
+        if not has_cxba_private_authority():
+            return _err(rid, 4035, "CXBA session branch requires a trusted private connection")
+        if "cxba_context" not in params:
+            return _err(rid, 4034, "CXBA session branch requires a new cxba_context")
+        try:
+            from tui_gateway.cxba_runtime import validate_session_binding
+
+            branch_cxba_binding = validate_session_binding(params.get("cxba_context"))
+        except ValueError as exc:
+            return _err(rid, 4034, f"invalid trusted cxba_context: {exc}")
+        if branch_cxba_binding["case_id"] != parent_cxba_binding["case_id"]:
+            return _err(rid, 4036, "branch cxba_context must remain in the parent Case")
+        if (
+            branch_cxba_binding["business_session_id"]
+            != parent_cxba_binding["business_session_id"]
+        ):
+            return _err(rid, 4036, "branch must remain in the parent business Session")
+        if (
+            branch_cxba_binding["business_branch_id"]
+            == parent_cxba_binding["business_branch_id"]
+        ):
+            return _err(rid, 4036, "branch requires a new business_branch_id")
+        for live_session in _sessions.values():
+            live_binding = live_session.get("cxba_binding")
+            if (
+                isinstance(live_binding, dict)
+                and live_binding.get("business_session_id")
+                == branch_cxba_binding["business_session_id"]
+                and live_binding.get("business_branch_id")
+                == branch_cxba_binding["business_branch_id"]
+            ):
+                return _err(rid, 4092, "business branch is already bound")
+    elif "cxba_context" in params:
+        return _err(rid, 4036, "a normal Hermes branch cannot acquire a CXBA binding")
     # Branch must write into the parent's profile-scoped state.db (app-global
     # remote mode). Using the launch handle would orphan branch rows + history.
+    persisted_branch_history = None
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5008)
@@ -2741,9 +2992,46 @@ def _(rid, params: dict) -> dict:
             history = [dict(msg) for msg in session.get("history", [])]
         if not history:
             return _err(rid, 4008, "nothing to branch — send a message first")
-        count = params.get("count")
-        if isinstance(count, int) and count > 0:
-            history = history[:count]
+        target_message_index = params.get("target_message_index")
+        target_message_row_id = params.get("target_message_row_id")
+        if target_message_index is not None and target_message_row_id is not None:
+            return _err(rid, 4008, "provide only target_message_row_id")
+        if target_message_row_id is not None:
+            if not isinstance(target_message_row_id, int) or target_message_row_id <= 0:
+                return _err(rid, 4008, "target_message_row_id must be a positive integer")
+            history = db.get_messages_as_conversation(
+                old_key,
+                include_ancestors=True,
+                include_inactive=True,
+                include_row_ids=True,
+            )
+            target_message_index = next(
+                (
+                    index
+                    for index, message in enumerate(history)
+                    if message.get("_row_id") == target_message_row_id
+                ),
+                None,
+            )
+            if target_message_index is None:
+                return _err(rid, 4008, "target_message_row_id is not in the session lineage")
+        if target_message_index is not None:
+            if (
+                not isinstance(target_message_index, int)
+                or target_message_index < 0
+                or target_message_index >= len(history)
+            ):
+                return _err(rid, 4008, "target_message_index is outside the session history")
+            if "edited_content" not in params or not isinstance(params.get("edited_content"), str):
+                return _err(rid, 4008, "edited_content must be a string")
+            edited = dict(history[target_message_index])
+            edited["content"] = params["edited_content"]
+            edited.pop("api_content", None)
+            history = history[:target_message_index] + [edited]
+        else:
+            count = params.get("count")
+            if isinstance(count, int) and count > 0:
+                history = history[:count]
         new_key = _new_session_key()
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
@@ -2759,6 +3047,25 @@ def _(rid, params: dict) -> dict:
                     if hasattr(db, "get_next_title_in_lineage")
                     else f"{current} (branch)"
                 )
+            branch_model_config = {"_branched_from": old_key}
+            if branch_cxba_binding is not None:
+                from tui_gateway.cxba_runtime import binding_from_model_config
+
+                if not hasattr(db, "list_sessions_rich"):
+                    return _err(rid, 5008, "session store cannot verify business branch binding")
+                for stored in db.list_sessions_rich(
+                    limit=10_000, include_children=True, include_archived=True
+                ):
+                    existing_binding = binding_from_model_config(stored.get("model_config"))
+                    if (
+                        existing_binding is not None
+                        and existing_binding["business_session_id"]
+                        == branch_cxba_binding["business_session_id"]
+                        and existing_binding["business_branch_id"]
+                        == branch_cxba_binding["business_branch_id"]
+                    ):
+                        return _err(rid, 4092, "business branch is already bound")
+                branch_model_config["_cxba_binding"] = copy.deepcopy(branch_cxba_binding)
             db.create_session(
                 new_key,
                 source=source,
@@ -2768,7 +3075,7 @@ def _(rid, params: dict) -> dict:
                 # the parent live (no end_reason='branched'), so the legacy
                 # end_reason heuristic never matches it — the marker is the only
                 # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
+                model_config=branch_model_config,
                 parent_session_id=old_key,
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
@@ -2787,8 +3094,11 @@ def _(rid, params: dict) -> dict:
                 new_key,
                 [
                     {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
+                        **{
+                            key: copy.deepcopy(value)
+                            for key, value in msg.items()
+                            if not str(key).startswith("_")
+                        },
                         # Preserve the parent's original message timestamps —
                         # branch copies are history, not new activity (9d73006ad).
                         "timestamp": msg.get("timestamp"),
@@ -2798,6 +3108,11 @@ def _(rid, params: dict) -> dict:
                 chunk_rows=500,
             )
             db.set_session_title(new_key, title)
+            if branch_cxba_binding is not None:
+                persisted_branch_history = db.get_messages_as_conversation(
+                    new_key,
+                    include_row_ids=True,
+                )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -2852,13 +3167,15 @@ def _(rid, params: dict) -> dict:
                 new_sid,
                 new_key,
                 agent,
-                list(history),
+                list(persisted_branch_history or history),
                 cols=session.get("cols", 80),
                 cwd=_session_cwd(session),
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
             )
+            if new_sid in _sessions:
+                _sessions[new_sid]["cxba_binding"] = branch_cxba_binding
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is
             # unconditional for the same reason as session.resume: past
@@ -2876,12 +3193,35 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        with _session_resume_lock:
+            partial = _pop_session_by_id(new_sid)
+        if partial is not None:
+            _teardown_popped_session(partial, end_reason="branch_init_failed")
+        try:
+            with _session_db(session) as cleanup_db:
+                if cleanup_db is not None:
+                    sessions_dir = (
+                        Path(parent_home) / "sessions"
+                        if parent_home
+                        else get_hermes_home() / "sessions"
+                    )
+                    cleanup_db.delete_session(new_key, sessions_dir=sessions_dir)
+        except Exception:
+            logger.error(
+                "event=session_branch stage=compensate status=failed storedSessionId=%s",
+                new_key,
+                exc_info=True,
+            )
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     finally:
         if branch_owns_db and branch_db is not None:
             with contextlib.suppress(Exception):
                 branch_db.close()
     branched_session = _sessions.get(new_sid)
+    response_history = persisted_branch_history or history
+    edited_message_row_id = None
+    if target_message_index is not None and target_message_index < len(response_history):
+        edited_message_row_id = response_history[target_message_index].get("_row_id")
     return _ok(
         rid,
         {
@@ -2889,9 +3229,351 @@ def _(rid, params: dict) -> dict:
             "stored_session_id": new_key,
             "title": title,
             "parent": old_key,
-            "message_count": len(history),
-            "messages": _history_to_messages(history),
+            "message_count": len(response_history),
+            "messages": _history_to_messages(
+                response_history,
+                include_raw_indexes=branch_cxba_binding is not None,
+            ),
+            **(
+                {
+                    "edited_message_row_id": edited_message_row_id,
+                    "edited_raw_message_index": target_message_index,
+                }
+                if edited_message_row_id is not None
+                else {}
+            ),
             "info": _session_info(agent, branched_session),
+        },
+    )
+
+
+def _require_cxba_private(rid):
+    from tui_gateway.transport import has_cxba_private_authority
+
+    if not has_cxba_private_authority():
+        return _err(rid, 4039, "operation requires a trusted CXBA private connection")
+    return None
+
+
+@method("cxba.business_session.retire")
+def _(rid, params: dict) -> dict:
+    """Retire one CXBA business Session without deleting its transcript."""
+    if err := _require_cxba_private(rid):
+        return err
+    case_id = str(params.get("case_id") or "").strip()
+    business_session_id = str(params.get("business_session_id") or "").strip()
+    reason = str(params.get("reason") or "").strip().upper()
+    if not case_id or not business_session_id:
+        return _err(rid, 4002, "case_id and business_session_id are required")
+    if reason not in {"CASE_CLOSED", "ARCHIVED_SESSION_DELETED"}:
+        return _err(
+            rid,
+            4002,
+            "reason must be CASE_CLOSED or ARCHIVED_SESSION_DELETED",
+        )
+
+    from tui_gateway.cxba_runtime import (
+        binding_from_model_config,
+        retire_business_session_runs,
+        validate_business_session_runs_retirable,
+    )
+
+    try:
+        validate_business_session_runs_retirable(case_id, business_session_id)
+    except ValueError as exc:
+        return _err(rid, 4093, str(exc))
+
+    profile = str(params.get("profile") or "").strip() or None
+    home = _profile_home(profile) or get_hermes_home()
+    live_sessions = []
+    stable_session_ids = []
+    newly_retired = []
+    with _session_resume_lock:
+        with _profile_db(params) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5000)
+            rows = db.list_sessions_rich(
+                limit=1_000_000,
+                include_children=True,
+                include_archived=True,
+                project_compression_tips=False,
+            )
+            matching_rows = []
+            for row in rows:
+                binding = binding_from_model_config(row.get("model_config"))
+                if (
+                    binding is not None
+                    and binding["case_id"] == case_id
+                    and binding["business_session_id"] == business_session_id
+                ):
+                    matching_rows.append(row)
+
+            with _sessions_lock:
+                matching_live = [
+                    (sid, session)
+                    for sid, session in _sessions.items()
+                    if isinstance(session.get("cxba_binding"), dict)
+                    and session["cxba_binding"].get("case_id") == case_id
+                    and session["cxba_binding"].get("business_session_id")
+                    == business_session_id
+                ]
+            claimed_live = []
+            for _sid, session in matching_live:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        for claimed in claimed_live:
+                            with claimed["history_lock"]:
+                                claimed.pop("_cxba_retiring", None)
+                        return _err(
+                            rid,
+                            4093,
+                            "business Session still has a running Hermes Session",
+                        )
+                    session["_cxba_retiring"] = True
+                    claimed_live.append(session)
+            with _sessions_lock:
+                for sid, session in matching_live:
+                    if _sessions.get(sid) is not session:
+                        continue
+                    popped = _sessions.pop(sid)
+                    popped["_sid"] = sid
+                    live_sessions.append(popped)
+
+            for row in matching_rows:
+                stable_session_id = str(row.get("id") or "").strip()
+                if not stable_session_id:
+                    continue
+                stable_session_ids.append(stable_session_id)
+                if db.get_session_model_config_value(
+                    stable_session_id, "_cxba_retired", False
+                ) is not True:
+                    db.patch_session_model_config(
+                        stable_session_id, {"_cxba_retired": True}
+                    )
+                    newly_retired.append(stable_session_id)
+
+    for session in live_sessions:
+        _teardown_popped_session(session, end_reason="cxba_retired")
+
+    from tui_gateway.turn_marker import clear_turn_marker
+
+    for stable_session_id in stable_session_ids:
+        clear_turn_marker(home, stable_session_id)
+    try:
+        retired_run_ids = retire_business_session_runs(
+            case_id, business_session_id
+        )
+    except ValueError as exc:
+        return _err(rid, 4093, str(exc))
+
+    return _ok(
+        rid,
+        {
+            "status": "retired",
+            "case_id": case_id,
+            "business_session_id": business_session_id,
+            "stable_session_ids": stable_session_ids,
+            "retired_run_ids": retired_run_ids,
+            "already_retired": bool(stable_session_ids) and not newly_retired,
+            "messages_preserved": True,
+        },
+    )
+
+
+@method("run.events.fetch")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    run_id = str(params.get("run_id") or "").strip()
+    case_id = str(params.get("case_id") or "").strip()
+    if not run_id:
+        return _err(rid, 4002, "run_id is required")
+    if not case_id:
+        return _err(rid, 4002, "case_id is required")
+    after_event_id = str(params.get("after_event_id") or "").strip()
+    try:
+        from tui_gateway.cxba_runtime import fetch_events
+
+        events = fetch_events(run_id, after_event_id, case_id=case_id)
+    except KeyError:
+        return _err(rid, 4040, "Run event buffer not found")
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    return _ok(rid, {"run_id": run_id, "events": events})
+
+
+@method("run.events.purge")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    case_id = str(params.get("case_id") or "").strip()
+    run_id = str(params.get("run_id") or "").strip()
+    if not case_id or not run_id:
+        return _err(rid, 4002, "case_id and run_id are required")
+    try:
+        from tui_gateway.cxba_runtime import purge_run_events
+
+        purge_run_events(case_id, run_id)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    return _ok(rid, {"run_id": run_id, "purged": True})
+
+
+@method("run.heartbeat")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    run_id = str(params.get("run_id") or "").strip()
+    if not run_id:
+        return _err(rid, 4002, "run_id is required")
+    try:
+        from tui_gateway.cxba_runtime import get_run, poll_run_heartbeat
+
+        run = get_run(run_id)
+        if run is None:
+            return _err(rid, 4040, "Run not found")
+        levels, changed, event_type = poll_run_heartbeat(run_id)
+        healthy = not bool(get_run(run_id).heartbeat_lost)
+        if changed and event_type:
+            _emit(event_type, run.runtime_session_id, {"levels": levels})
+        return _ok(
+            rid,
+            {"run_id": run_id, "status": "RUNNING" if healthy else "UNREACHABLE", **levels},
+        )
+    except (OSError, ValueError) as exc:
+        return _err(rid, 5000, f"heartbeat probe failed: {exc}")
+
+
+@method("run.approval.resolve")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    sid = str(params.get("session_id") or "").strip()
+    run_id = str(params.get("run_id") or "").strip()
+    proposal_id = str(params.get("proposal_id") or "").strip()
+    status = str(params.get("status") or "").strip()
+    try:
+        pending_count = int(params.get("pending_count"))
+    except (TypeError, ValueError):
+        return _err(rid, 4002, "pending_count must be an integer")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4004, "session not found")
+    try:
+        from tui_gateway.cxba_runtime import (
+            approval_prompt,
+            approval_events_snapshot,
+            discard_queued_approval_result,
+            drain_approval_events,
+            get_run,
+            queue_approval_result,
+        )
+
+        run = get_run(run_id)
+        if run is None or run.runtime_session_id != sid:
+            return _err(rid, 4040, "Run does not belong to the runtime session")
+        event = queue_approval_result(
+            run_id,
+            proposal_id=proposal_id,
+            status=status,
+            content=params.get("content"),
+            pending_count=pending_count,
+        )
+        prompt = approval_prompt(event)
+        _emit("approval.result", sid, event)
+        with session["history_lock"]:
+            running = bool(session.get("running"))
+            agent = session.get("agent")
+            if not running:
+                session["running"] = True
+        if running:
+            if agent is None or not hasattr(agent, "steer") or not agent.steer(prompt):
+                discard_queued_approval_result(run_id, event)
+                return _err(rid, 4091, "active Run could not accept the approval result")
+            session["_cxba_approval_steer_pending"] = True
+            _emit("approval.result.queued", sid, {"proposal_id": proposal_id})
+            return _ok(rid, {"status": "queued", "run_id": run_id})
+
+        prompts = [approval_prompt(item) for item in approval_events_snapshot(run_id)]
+        started = _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            "\n\n".join(prompts),
+            display_kind="cxba_approval_result",
+            display_metadata={"proposal_id": proposal_id, "status": event["status"]},
+            trusted_run_context=run.context,
+            consumes_cxba_approvals=True,
+        )
+        if not started:
+            discard_queued_approval_result(run_id, event)
+            with session["history_lock"]:
+                session["running"] = False
+            return _err(
+                rid,
+                5031,
+                "approval continuation could not start; retry delivery explicitly",
+            )
+        return _ok(rid, {"status": "continuing", "run_id": run_id})
+    except (KeyError, ValueError) as exc:
+        with session["history_lock"]:
+            if not session.get("_run_thread"):
+                session["running"] = False
+        return _err(rid, 4002, str(exc))
+
+
+@method("session.safe_stop")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if _session_uses_compute_host(session):
+        return _err(rid, 5020, "safe stop is unavailable for compute-host turns")
+    sid = str(params.get("session_id") or "")
+    with session["history_lock"]:
+        running = bool(session.get("running"))
+        if not running and _is_cxba_run_session(sid):
+            from tui_gateway.cxba_runtime import request_safe_stop, run_for_session
+
+            run = run_for_session(sid)
+            if run is not None and run.pending_proposals:
+                request_safe_stop(run.run_id)
+                session["_safe_stop_requested"] = True
+                _emit("safe_stop.requested", sid, {"status": "SAFE_STOPPING"})
+                return _ok(
+                    rid,
+                    {
+                        "status": "safe_stopping",
+                        "control_outcome": "accepted",
+                        "agent_ready": False,
+                    },
+                )
+        if not running:
+            return _ok(rid, {"status": "idle", "control_outcome": "idle"})
+        session["_safe_stop_requested"] = True
+        session["queued_prompt"] = None
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
+        agent = session.get("agent")
+    accepted = bool(
+        agent is not None
+        and getattr(agent, "request_safe_stop", lambda: False)()
+    )
+    if _is_cxba_run_session(sid):
+        from tui_gateway.cxba_runtime import request_safe_stop, run_for_session
+
+        run = run_for_session(sid)
+        if run is not None:
+            request_safe_stop(run.run_id)
+        _emit("safe_stop.requested", sid, {"status": "SAFE_STOPPING"})
+    return _ok(
+        rid,
+        {
+            "status": "safe_stopping",
+            "control_outcome": "accepted",
+            "agent_ready": accepted,
         },
     )
 
@@ -2903,10 +3585,28 @@ def _(rid, params: dict) -> dict:
     _tts_stream_stop()
     session, err = _sess_nowait(params, rid)
     if err:
+        run_id = str(params.get("run_id") or "").strip()
+        if run_id and _require_cxba_private(rid) is None:
+            try:
+                from tools.run_sandbox import destroy_run_sandbox
+
+                destroy_run_sandbox(run_id)
+            except (OSError, RuntimeError, ValueError) as exc:
+                return _err(rid, 5032, f"Run Sandbox cleanup failed: {exc}")
+            return _ok(
+                rid,
+                {
+                    "status": "interrupted",
+                    "control_outcome": "idle",
+                    "turn_isolation": True,
+                    "runtime_session_present": False,
+                },
+            )
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        if session.get("running"):
+        compute_running = bool(session.get("running"))
+        if compute_running:
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
@@ -2923,7 +3623,14 @@ def _(rid, params: dict) -> dict:
             resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
         except Exception:
             pass
-        return _ok(rid, {"status": "interrupted", "turn_isolation": True})
+        return _ok(
+            rid,
+            {
+                "status": "interrupted",
+                "control_outcome": "accepted" if compute_running else "idle",
+                "turn_isolation": True,
+            },
+        )
     session, err = _sess(params, rid)
     if err:
         return err
@@ -2967,7 +3674,48 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
-    return _ok(rid, {"status": "interrupted"})
+    sid = str(params.get("session_id") or "")
+    cxba_force_stopped = False
+    if _is_cxba_run_session(sid):
+        try:
+            from tools.run_sandbox import destroy_run_sandbox
+            from tui_gateway.cxba_runtime import (
+                detach_completed_run,
+                force_stop_run,
+                run_for_session,
+            )
+
+            run = run_for_session(sid)
+            if run is not None:
+                cxba_force_stopped = True
+                force_stop_run(run.run_id)
+                _emit("force_stop.requested", sid, {"status": "FORCE_STOPPING"})
+                from tools.async_delegation import interrupt_for_session
+
+                interrupt_for_session(
+                    session_key=str(session.get("session_key") or ""),
+                    origin_ui_session_id=sid,
+                    parent_session_id=str(
+                        getattr(session.get("agent"), "session_id", "") or ""
+                    ),
+                    reason="cxba_force_stop",
+                )
+                destroy_run_sandbox(run.run_id)
+                _emit("force_stop.completed", sid, {"status": "FORCE_STOPPED"})
+                detach_completed_run(run.run_id, "FORCE_STOPPED")
+                session.pop("active_cxba_run_id", None)
+        except Exception as exc:
+            logger.exception("event=force_stop stage=destroy status=failed sessionId=%s", sid)
+            return _err(rid, 5032, f"force stop could not remove the Run sandbox: {exc}")
+    return _ok(
+        rid,
+        {
+            "status": "interrupted",
+            "control_outcome": (
+                "accepted" if should_interrupt or cxba_force_stopped else "idle"
+            ),
+        },
+    )
 
 
 @method("delegation.status")
@@ -3188,6 +3936,41 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    sid = str(params.get("session_id") or "")
+    cxba_run = None
+    if _is_cxba_run_session(sid):
+        from tui_gateway.cxba_runtime import run_for_session
+
+        cxba_run = run_for_session(sid)
+        if cxba_run is None:
+            return _err(rid, 4094, "CXBA Run is terminal or detached")
+        if cxba_run.status == "SAFE_STOPPING":
+            return _err(rid, 4094, "CXBA Run is stopping and cannot accept steer")
+        if not session.get("running"):
+            with session["history_lock"]:
+                if session.get("running"):
+                    return _err(rid, 4009, "session busy")
+                session["running"] = True
+            if not _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind="cxba_read_only_continuation",
+                trusted_run_context=cxba_run.context,
+            ):
+                with session["history_lock"]:
+                    session["running"] = False
+                return _err(rid, 5031, "CXBA Run continuation could not start")
+            _emit("steer.received", sid, {"status": "CONTINUING"})
+            return _ok(
+                rid,
+                {
+                    "status": "continuing",
+                    "control_outcome": "accepted",
+                    "text": text,
+                },
+            )
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
@@ -3203,7 +3986,24 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             _record_inflight_correction(session, text)
             session["last_active"] = time.time()
-    return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
+        if cxba_run is not None:
+            _emit(
+                "steer.received",
+                str(params.get("session_id") or ""),
+                {"status": "QUEUED"},
+            )
+    return _ok(
+        rid,
+        {
+            "status": "queued" if accepted else "rejected",
+            "control_outcome": (
+                "accepted"
+                if accepted
+                else "idle" if not session.get("running") else "rejected"
+            ),
+            "text": text,
+        },
+    )
 
 
 @method("session.redirect")
@@ -3215,6 +4015,15 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    sid = str(params.get("session_id") or "")
+    if _is_cxba_run_session(sid):
+        from tui_gateway.cxba_runtime import run_for_session
+
+        cxba_run = run_for_session(sid)
+        if cxba_run is None:
+            return _err(rid, 4094, "CXBA Run is terminal or detached")
+        if cxba_run.status == "SAFE_STOPPING":
+            return _err(rid, 4094, "CXBA Run is stopping and cannot be redirected")
     agent = session.get("agent")
     # Turn-build window: a fresh turn flips running=True and kicks off an async
     # agent build, so session["agent"] is briefly None. That is not an
@@ -3224,7 +4033,10 @@ def _(rid, params: dict) -> dict:
     if agent is None and session.get("running"):
         _enqueue_prompt(session, text, current_transport() or _stdio_transport)
         session["last_active"] = time.time()
-        return _ok(rid, {"status": "queued", "text": text})
+        return _ok(
+            rid,
+            {"status": "queued", "control_outcome": "accepted", "text": text},
+        )
     if (
         agent is None
         or getattr(agent, "_supports_active_turn_redirect", False) is not True
@@ -3241,7 +4053,15 @@ def _(rid, params: dict) -> dict:
             session["last_active"] = time.time()
     return _ok(
         rid,
-        {"status": "redirected" if accepted else "rejected", "text": text},
+        {
+            "status": "redirected" if accepted else "rejected",
+            "control_outcome": (
+                "accepted"
+                if accepted
+                else "idle" if not session.get("running") else "rejected"
+            ),
+            "text": text,
+        },
     )
 
 

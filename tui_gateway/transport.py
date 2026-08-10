@@ -87,6 +87,12 @@ def current_transport() -> Optional[Transport]:
     return _current_transport.get()
 
 
+def has_cxba_private_authority() -> bool:
+    """Return connection-bound authority for trusted Spring Run context."""
+    transport = current_transport()
+    return bool(transport and getattr(transport, "cxba_private_authority", False))
+
+
 def bind_transport(transport: Optional[Transport]):
     """Bind *transport* for the current context. Returns a token for :func:`reset_transport`."""
     return _current_transport.set(transport)

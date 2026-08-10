@@ -790,6 +790,8 @@ def init_agent(
     # Explicit hard cancellation is separate from redirect/message state. A
     # thread-safe Event makes the cause atomic for auxiliary stream pollers.
     agent._hard_interrupt_requested = threading.Event()
+    # Safe stop is a tool-boundary latch: it never interrupts a running tool.
+    agent._safe_stop_requested = threading.Event()
     agent._execution_thread_id: int | None = None  # Set at run_conversation() start
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()

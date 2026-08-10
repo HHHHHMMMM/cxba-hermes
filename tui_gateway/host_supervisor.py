@@ -143,6 +143,7 @@ class HostSupervisor:
         heartbeat_secs: int = 15,
         expected_build_sha: str | None = None,
         expected_hermes_home: str | None = None,
+        redact_child_stderr: bool = False,
         autostart: bool = True,
     ) -> None:
         self.registry_path = Path(registry_path) if registry_path is not None else _default_registry_path()
@@ -154,6 +155,7 @@ class HostSupervisor:
         self.heartbeat_secs = max(1, int(heartbeat_secs))
         self.expected_build_sha = expected_build_sha if expected_build_sha is not None else _build_sha()
         self.expected_hermes_home = expected_hermes_home if expected_hermes_home is not None else str(get_hermes_home())
+        self.redact_child_stderr = bool(redact_child_stderr)
 
         self._lock = threading.RLock()
         self._proc: subprocess.Popen[str] | None = None
@@ -348,6 +350,8 @@ class HostSupervisor:
         self._wait_thread.start()
         if not self._hello_event.wait(timeout=10.0):
             self._terminate_process(proc)
+            if self.redact_child_stderr:
+                raise RuntimeError("compute host did not send hello; child diagnostics were redacted")
             raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
         self._validate_hello()
         self._persist_registry()
@@ -399,7 +403,13 @@ class HostSupervisor:
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("compute host emitted invalid json: %r", raw[:200])
+                if self.redact_child_stderr:
+                    logger.warning(
+                        "event=compute_host stage=stdout status=invalid_json chars=%d",
+                        len(raw),
+                    )
+                else:
+                    logger.warning("compute host emitted invalid json: %r", raw[:200])
                 continue
             if isinstance(frame, dict):
                 self._handle_host_frame(frame)
@@ -409,8 +419,13 @@ class HostSupervisor:
         for raw in proc.stderr:
             text = raw.rstrip("\n")
             if text:
-                self._stderr_tail = (self._stderr_tail + [text])[-80:]
-                logger.warning("compute host stderr: %s", text)
+                if self.redact_child_stderr:
+                    marker = f"[REDACTED child stderr chars={len(text)}]"
+                    self._stderr_tail = (self._stderr_tail + [marker])[-80:]
+                    logger.warning("event=compute_host stage=stderr status=reported chars=%d", len(text))
+                else:
+                    self._stderr_tail = (self._stderr_tail + [text])[-80:]
+                    logger.warning("compute host stderr: %s", text)
 
     def _handle_host_frame(self, frame: dict[str, Any]) -> None:
         ftype = str(frame.get("type") or "")

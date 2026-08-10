@@ -164,3 +164,28 @@ def test_flush_skips_thinking_prefill_scaffolding():
     agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
+
+
+def test_flush_never_writes_partial_stream_recovery_scaffolding():
+    agent = _agent_with_capturing_db()
+    messages = [
+        {"role": "user", "content": "inspect the case"},
+        {
+            "role": "assistant",
+            "content": "The previous action was interrupted before completion; its partial response was discarded.",
+            "_stream_recovery_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "Recover from durable state and continue.",
+            "_stream_recovery_synthetic": True,
+        },
+        {"role": "assistant", "content": "Recovered result."},
+    ]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+    assert [row["content"] for row in agent._session_db.rows] == [
+        "inspect the case",
+        "Recovered result.",
+    ]

@@ -100,6 +100,19 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+def _is_database_credential_name(name: str) -> bool:
+    upper = str(name or "").upper()
+    return bool(
+        upper == "DATABASE_URL"
+        or upper.startswith("PG")
+        or upper.startswith("POSTGRES")
+        or (
+            "DATASOURCE" in upper
+            and any(part in upper for part in ("URL", "USER", "PASSWORD"))
+        )
+    )
+
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -236,6 +249,62 @@ def reap_orphan_containers(
                 )
         except (subprocess.TimeoutExpired, OSError) as e:
             logger.debug("orphan reaper docker rm %s failed: %s", cid[:12], e)
+    return removed
+
+
+def remove_task_containers(
+    task_id: str,
+    *,
+    profile_filter: str | None = None,
+    docker_exe: str | None = None,
+) -> int:
+    """Synchronously remove containers for one trusted task id.
+
+    This is the explicit recovery boundary used after a Gateway process restart:
+    the in-memory environment registry may be empty while Docker still owns the
+    previous Run container.  The trusted task label is the durable lookup key.
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id must be a non-empty string")
+    docker = docker_exe or find_docker() or "docker"
+    filters = [
+        "--filter", "label=hermes-agent=1",
+        "--filter", f"label=hermes-task-id={_sanitize_label_value(task_id.strip())}",
+    ]
+    if profile_filter:
+        filters.extend([
+            "--filter",
+            f"label=hermes-profile={_sanitize_label_value(profile_filter)}",
+        ])
+    listing = subprocess.run(
+        [docker, "ps", "-a", *filters, "--format", "{{.ID}}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if listing.returncode != 0:
+        raise RuntimeError("docker task container lookup failed")
+    container_ids = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+    removed = 0
+    for container_id in container_ids:
+        result = subprocess.run(
+            [docker, "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 0 or "No such container" in (result.stderr or ""):
+            removed += 1
+            continue
+        raise RuntimeError("docker task container removal failed")
     return removed
 
 
@@ -887,6 +956,7 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        deny_database_credentials: bool = False,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -894,8 +964,18 @@ class DockerEnvironment(BaseEnvironment):
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
+        self._deny_database_credentials = bool(deny_database_credentials)
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        if getattr(self, "_deny_database_credentials", False):
+            self._forward_env = [
+                name for name in self._forward_env
+                if not _is_database_credential_name(name)
+            ]
+            self._env = {
+                name: value for name, value in self._env.items()
+                if not _is_database_credential_name(name)
+            }
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
@@ -903,7 +983,10 @@ class DockerEnvironment(BaseEnvironment):
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
-        logger.info("DockerEnvironment volumes: %s", volumes)
+        logger.info(
+            "event=docker_environment stage=mounts status=configured mountCount=%d",
+            len(volumes) if isinstance(volumes, list) else 0,
+        )
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
             logger.warning("docker_volumes config is not a list: %r", volumes)
@@ -1569,6 +1652,11 @@ class DockerEnvironment(BaseEnvironment):
             k for k in passthrough_keys if not _is_hermes_internal_secret(k)
         }
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        if getattr(self, "_deny_database_credentials", False):
+            forward_keys = {
+                name for name in forward_keys
+                if not _is_database_credential_name(name)
+            }
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):
@@ -1953,6 +2041,7 @@ class DockerEnvironment(BaseEnvironment):
         thread to finish before the interpreter exits, so ``docker stop`` /
         ``docker rm`` actually completes when we do trigger it.
         """
+        self._cleanup_error = None
         container_id = self._container_id
         if not container_id:
             # Still drop the bind-mount dirs if any were allocated and we're
@@ -1990,25 +2079,48 @@ class DockerEnvironment(BaseEnvironment):
         docker_exe = self._docker_exe
         log_id = container_id[:12]
 
+        cleanup_dirs = tuple(d for d in (self._workspace_dir, self._home_dir) if d)
+
         def _do_cleanup() -> None:
+            errors: list[str] = []
+
+            def _container_is_already_absent(result: subprocess.CompletedProcess) -> bool:
+                stderr = result.stderr or b""
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
+                return "no such container" in str(stderr).lower()
+
             if should_stop:
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         [docker_exe, "stop", "-t", "10", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )
+                    if result.returncode != 0 and not _container_is_already_absent(result):
+                        errors.append(f"docker stop exited with status {result.returncode}")
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("docker stop %s timed out / failed: %s", log_id, e)
+                    errors.append(f"docker stop failed with {type(e).__name__}")
             if should_remove:
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         [docker_exe, "rm", "-f", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )
+                    if result.returncode != 0 and not _container_is_already_absent(result):
+                        errors.append(f"docker rm exited with status {result.returncode}")
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("docker rm -f %s failed: %s", log_id, e)
+                    errors.append(f"docker rm failed with {type(e).__name__}")
+            if errors:
+                self._cleanup_error = "; ".join(errors)
+                return
+            self._container_id = None
+            if should_remove and not self._persistent:
+                for directory in cleanup_dirs:
+                    shutil.rmtree(directory, ignore_errors=True)
 
         # Daemon thread: doesn't block interpreter exit (atexit returns
         # promptly), but unlike the old ``Popen(... &)`` shell trick the
@@ -2020,15 +2132,6 @@ class DockerEnvironment(BaseEnvironment):
         t = threading.Thread(target=_do_cleanup, daemon=True, name=f"hermes-cleanup-{log_id}")
         t.start()
         self._cleanup_thread = t
-        self._container_id = None
-
-        # Bind-mount dir teardown only runs when we actually removed the
-        # container (the dirs are the container's filesystem state; keeping
-        # them around with no container would orphan the data on disk).
-        if should_remove and not self._persistent:
-            for d in (self._workspace_dir, self._home_dir):
-                if d:
-                    shutil.rmtree(d, ignore_errors=True)
 
     def wait_for_cleanup(self, timeout: float = 30.0) -> bool:
         """Block up to *timeout* seconds for the cleanup worker thread.
@@ -2044,3 +2147,11 @@ class DockerEnvironment(BaseEnvironment):
             return True
         thread.join(timeout=timeout)
         return not thread.is_alive()
+
+    def wait_for_cleanup_result(self, timeout: float = 65.0) -> None:
+        """Wait for explicit teardown and fail if Docker did not stop/remove it."""
+        if not self.wait_for_cleanup(timeout=timeout):
+            raise TimeoutError("Docker cleanup did not finish")
+        error = getattr(self, "_cleanup_error", None)
+        if error:
+            raise RuntimeError(error)

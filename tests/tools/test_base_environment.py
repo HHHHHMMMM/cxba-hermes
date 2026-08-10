@@ -22,6 +22,34 @@ class _TestableEnv(BaseEnvironment):
         pass
 
 
+def test_wait_for_process_refreshes_cxba_tool_heartbeat(monkeypatch):
+    import subprocess
+
+    from tools import run_sandbox
+
+    observed = []
+    monkeypatch.setattr(
+        run_sandbox,
+        "record_tool_process_heartbeat",
+        lambda run_id, alive: observed.append((run_id, alive)),
+    )
+    env = _TestableEnv(timeout=10)
+    env._task_id = "run-long-tool"
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 2.2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    result = env._wait_for_process(proc, timeout=10)
+
+    assert result["returncode"] == 0
+    assert observed[0] == ("run-long-tool", True)
+    assert observed[-1] == ("run-long-tool", False)
+    assert sum(alive for _run_id, alive in observed) >= 2
+
+
 class TestBoundedOutputCollector:
     def test_large_stream_retains_bounded_head_and_tail(self):
         collector = _BoundedOutputCollector(1_000)

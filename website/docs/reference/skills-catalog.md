@@ -52,6 +52,15 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`songwriting-and-ai-music`](/docs/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | Songwriting craft and Suno AI music prompts. | `creative/songwriting-and-ai-music` |
 | [`touchdesigner-mcp`](/docs/user-guide/skills/bundled/creative/creative-touchdesigner-mcp) | Control TouchDesigner via twozero MCP. | `creative/touchdesigner-mcp` |
 
+## cxba
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`cxba-case-investigation`](/docs/user-guide/skills/bundled/cxba/cxba-cxba-case-investigation) | Guide evidence-led investigation of CXBA case materials. | `cxba/cxba-case-investigation` |
+| [`cxba-material-profiling`](/docs/user-guide/skills/bundled/cxba/cxba-cxba-material-profiling) | Profile case materials without treating metadata as proof. | `cxba/cxba-material-profiling` |
+| [`cxba-raw-material-investigation`](/docs/user-guide/skills/bundled/cxba/cxba-cxba-raw-material-investigation) | Test case hypotheses against sources and counter-evidence. | `cxba/cxba-raw-material-investigation` |
+| [`cxba-safe-tabular-analysis`](/docs/user-guide/skills/bundled/cxba/cxba-cxba-safe-tabular-analysis) | Analyze large case tables with exact, bounded computation. | `cxba/cxba-safe-tabular-analysis` |
+
 ## email
 
 | Skill | Description | Path |

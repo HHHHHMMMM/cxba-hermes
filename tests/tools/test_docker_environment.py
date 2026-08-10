@@ -6,6 +6,22 @@ import subprocess
 import pytest
 
 from tools.environments import docker as docker_env
+from tools.environments.docker import _is_database_credential_name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PGHOST", "PGPASSWORD", "POSTGRES_PASSWORD", "DATABASE_URL",
+        "SPRING_DATASOURCE_URL", "SPRING_DATASOURCE_USERNAME",
+    ],
+)
+def test_database_credential_names_are_denied_for_case_sandboxes(name):
+    assert _is_database_credential_name(name) is True
+
+
+def test_non_database_environment_name_is_not_denied_for_case_sandboxes():
+    assert _is_database_credential_name("TZ") is False
 
 
 def _mock_subprocess_run(monkeypatch):
@@ -1040,6 +1056,53 @@ def test_cleanup_with_persist_disabled_stops_and_rms(monkeypatch):
         "docker rm MUST run when persist_across_processes=False, even with "
         "persistent_filesystem=True — that gating was the leak source in #20561."
     )
+
+
+def test_explicit_cleanup_reports_docker_stop_failure(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    _install_fake_thread(monkeypatch)
+    env = _make_dummy_env(
+        task_id="cleanup-failure",
+        persist_across_processes=False,
+    )
+    container_id = env._container_id
+
+    def fail_stop(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) > 1 and cmd[1] == "stop":
+            return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="denied")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fail_stop)
+    env.cleanup(force_remove=True)
+    with pytest.raises(RuntimeError, match="docker stop exited with status 7"):
+        env.wait_for_cleanup_result()
+    assert env._container_id == container_id
+
+
+def test_explicit_cleanup_accepts_container_removed_by_concurrent_cleanup(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    _install_fake_thread(monkeypatch)
+    env = _make_dummy_env(
+        task_id="cleanup-already-absent",
+        persist_across_processes=False,
+    )
+
+    def already_absent(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout=b"",
+            stderr=b"Error response from daemon: No such container: already-gone",
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", already_absent)
+    env.cleanup(force_remove=True)
+    env.wait_for_cleanup_result()
+    assert env._container_id is None
 
 
 def test_cleanup_uses_subprocess_run_not_detached_shell(monkeypatch):

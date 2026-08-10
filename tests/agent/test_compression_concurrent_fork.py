@@ -775,6 +775,18 @@ def _no_consecutive_user_roles(messages: list) -> bool:
     )
 
 
+def test_stream_recovery_prompt_is_not_treated_as_human_intent() -> None:
+    from agent.conversation_compression import _is_real_user_message
+
+    recovery = {
+        "role": "user",
+        "content": "[System: Resume from durable task state.]",
+        "_stream_recovery_synthetic": True,
+    }
+
+    assert _is_real_user_message(recovery) is False
+
+
 def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
     """Anchor restoration must preserve strict role alternation (#55677).
 

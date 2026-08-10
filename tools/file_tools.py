@@ -1354,6 +1354,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_container_task_id,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        _container_config_for_task,
     )
     import time
 
@@ -1407,6 +1408,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             config = _get_env_config()
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
+            env_type = overrides.get("env_type") or env_type
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -1449,18 +1451,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             container_config = None
             if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "vercel_runtime": config.get("vercel_runtime", ""),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "docker_network": config.get("docker_network", True),
-                }
+                container_config = _container_config_for_task(config, overrides)
 
             ssh_config = None
             if env_type == "ssh":

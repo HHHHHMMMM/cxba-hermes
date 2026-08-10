@@ -76,6 +76,62 @@ class TestResolveClientCert:
 
 
 class TestHTTPClientCert:
+    def test_trust_env_false_is_forwarded_to_async_client(self):
+        """Private/intranet MCP servers can bypass workstation proxy settings."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("local")
+        captured: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class DummyTransportCtx:
+            async def __aenter__(self):
+                return MagicMock(), MagicMock(), (lambda: None)
+
+            async def __aexit__(self, *a):
+                return False
+
+        class DummySession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def initialize(self):
+                return None
+
+        async def _discover_tools(self):
+            self._shutdown_event.set()
+
+        async def _drive():
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
+                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_tool.streamable_http_client",
+                       return_value=DummyTransportCtx()), \
+                 patch("tools.mcp_tool.ClientSession", DummySession), \
+                 patch.object(MCPServerTask, "_discover_tools", _discover_tools):
+                await server._run_http({
+                    "url": "http://127.0.0.1:8290/mcp",
+                    "trust_env": False,
+                })
+
+        asyncio.run(_drive())
+        assert captured["trust_env"] is False
+
     def test_cert_forwarded_to_async_client(self, tmp_path):
         """When client_cert is set, the new-SDK HTTP path passes ``cert=``
         into ``httpx.AsyncClient``."""

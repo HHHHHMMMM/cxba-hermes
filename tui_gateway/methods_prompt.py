@@ -111,6 +111,38 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if session.get("_cxba_retiring"):
+        return _err(rid, 4100, "CXBA business Session is retiring and cannot accept prompts")
+    trusted_run_context = None
+    if "run_context" in params:
+        from tui_gateway.transport import has_cxba_private_authority
+
+        if not has_cxba_private_authority():
+            return _err(rid, 4031, "run_context requires a trusted CXBA private connection")
+        try:
+            from tools.run_sandbox import validate_run_context
+
+            trusted_run_context = validate_run_context(params.get("run_context"))
+        except (OSError, ValueError) as exc:
+            return _err(rid, 4032, f"invalid trusted run_context: {exc}")
+    cxba_binding = session.get("cxba_binding")
+    if cxba_binding is not None and trusted_run_context is None:
+        return _err(rid, 4037, "CXBA session prompt requires a trusted run_context")
+    if trusted_run_context is not None:
+        try:
+            from tui_gateway.cxba_runtime import (
+                run_for_session,
+                validate_run_matches_binding,
+            )
+
+            validate_run_matches_binding(cxba_binding, trusted_run_context)
+            active_run = run_for_session(sid)
+            if active_run is not None and active_run.run_id != trusted_run_context.run_id:
+                return _err(rid, 4093, "runtime session already has a different active Run")
+            if active_run is not None and active_run.status == "SAFE_STOPPING":
+                return _err(rid, 4094, "Run is safe-stopping; only approval completion may continue")
+        except ValueError as exc:
+            return _err(rid, 4038, f"run_context does not match the session binding: {exc}")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
@@ -142,6 +174,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            trusted_run_context=trusted_run_context,
         )
         if busy_response is not None:
             return busy_response
@@ -150,6 +183,12 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        if session.get("_cxba_retiring"):
+            return _err(
+                rid,
+                4100,
+                "CXBA business Session is retiring and cannot accept prompts",
+            )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -274,6 +313,9 @@ def _(rid, params: dict) -> dict:
             session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
         session["_turn_cancel_requested"] = False
+        session["_safe_stop_requested"] = False
+        if session.get("agent") is not None and hasattr(session["agent"], "clear_safe_stop"):
+            session["agent"].clear_safe_stop()
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
@@ -357,7 +399,12 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if trusted_run_context is None:
+            _run_prompt_submit(rid, sid, session, text)
+        else:
+            _run_prompt_submit(
+                rid, sid, session, text, trusted_run_context=trusted_run_context
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

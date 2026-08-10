@@ -10,7 +10,7 @@ config -> signature -> AIAgent kwargs.
 
 import pytest
 
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _platform_context_policy
 
 
 class TestSkipContextFilesSignature:
@@ -55,6 +55,19 @@ class TestSkipContextFilesSignature:
         )
         assert sig_default == sig_false
 
+    def test_signature_differs_when_soul_identity_toggled(self):
+        sig_on = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", self.RUNTIME, ["hermes-telegram"], "",
+            skip_context_files=True,
+            load_soul_identity=True,
+        )
+        sig_off = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", self.RUNTIME, ["hermes-telegram"], "",
+            skip_context_files=True,
+            load_soul_identity=False,
+        )
+        assert sig_on != sig_off
+
 
 class TestSkipContextFilesConfigResolution:
     """The gateway resolution path: platform config dict -> bool."""
@@ -75,9 +88,19 @@ class TestSkipContextFilesConfigResolution:
         ],
     )
     def test_resolution(self, cfg, platform_key, expected):
-        # Mirror the production resolution in TurnRunner exactly.
-        _platforms_gw_cfg = (cfg.get("gateway") or {}).get("platforms") or {}
-        _plat_gw_cfg = _platforms_gw_cfg.get(platform_key) or {}
-        _skip_context = _plat_gw_cfg.get("skip_context_files")
-        skip_context_files = bool(_skip_context) if _skip_context is not None else False
+        skip_context_files, _ = _platform_context_policy(cfg, platform_key)
         assert skip_context_files is expected
+
+    @pytest.mark.parametrize(
+        ("cfg", "expected"),
+        [
+            ({}, True),
+            ({"gateway": {"platforms": {"telegram": {}}}}, True),
+            ({"gateway": {"platforms": {"telegram": {"load_soul_identity": True}}}}, True),
+            ({"gateway": {"platforms": {"telegram": {"load_soul_identity": False}}}}, False),
+            ({"gateway": {"platforms": {"discord": {"load_soul_identity": False}}}}, True),
+        ],
+    )
+    def test_soul_identity_resolution(self, cfg, expected):
+        _, load_soul_identity = _platform_context_policy(cfg, "telegram")
+        assert load_soul_identity is expected

@@ -1296,6 +1296,15 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
     """
+    try:
+        from tools.run_sandbox import current_run_sandbox_id
+
+        bound_run_id = current_run_sandbox_id()
+    except ImportError:
+        bound_run_id = None
+    if bound_run_id:
+        return bound_run_id
+
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
@@ -1623,8 +1632,28 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_shm_size": config.get("docker_shm_size", "1g"),
         "docker_network": config.get("docker_network", True),
         "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+        "docker_deny_database_credentials": config.get("docker_deny_database_credentials", False),
         "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
     }
+
+
+def _container_config_for_task(config: Dict[str, Any], overrides: Dict[str, Any]) -> dict:
+    """Merge the small, trusted set of per-task container overrides."""
+    merged = _container_config_from_config(config)
+    for key in (
+        "container_persistent",
+        "docker_volumes",
+        "docker_mount_cwd_to_workspace",
+        "docker_persist_across_processes",
+        "docker_deny_database_credentials",
+    ):
+        if key in overrides:
+            merged[key] = overrides[key]
+    if overrides.get("run_sandbox"):
+        from tools.run_sandbox import validate_registered_mount_sources
+
+        validate_registered_mount_sources(merged.get("docker_volumes"))
+    return merged
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
@@ -1684,6 +1713,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            deny_database_credentials=cc.get("docker_deny_database_credentials", False),
             shm_size=cc.get("docker_shm_size", "1g"),
         )
     
@@ -1818,6 +1848,13 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
+                try:
+                    from tui_gateway.cxba_runtime import should_preserve_in_idle_reaper
+
+                    if should_preserve_in_idle_reaper(task_id):
+                        continue
+                except ImportError:
+                    pass
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
@@ -1917,7 +1954,8 @@ def ensure_task_env(task_id: Optional[str] = None):
     failure leaves the caller's fail-closed error path intact).
     """
     config = _get_env_config()
-    env_type = config["env_type"]
+    overrides = resolve_task_overrides(task_id)
+    env_type = overrides.get("env_type") or config["env_type"]
     if env_type == "local":
         return None
 
@@ -1930,7 +1968,6 @@ def ensure_task_env(task_id: Optional[str] = None):
             _last_activity[effective_task_id] = time.time()
         return existing
 
-    overrides = resolve_task_overrides(task_id)
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
     elif env_type == "singularity":
@@ -1957,11 +1994,11 @@ def ensure_task_env(task_id: Optional[str] = None):
             new_env = _create_environment(
                 env_type=env_type,
                 image=image,
-                cwd=config["cwd"],
+                cwd=overrides.get("cwd") or config["cwd"],
                 timeout=config["timeout"],
                 ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
                 container_config=(
-                    _container_config_from_config(config)
+                    _container_config_for_task(config, overrides)
                     if env_type in _CONTAINER_BACKENDS else None
                 ),
                 local_config=None,
@@ -2097,6 +2134,55 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             logger.info("Environment for task %s already cleaned up", task_id)
         else:
             logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+
+
+def cleanup_vm_and_wait(task_id: str, *, force_remove: bool = False) -> None:
+    """Synchronously tear down one explicitly managed environment.
+
+    CXBA uses this terminal boundary so it never reports a Run stopped before
+    Docker confirms the stop/remove result. Ordinary Hermes cleanup remains
+    asynchronous and unchanged.
+    """
+    with _env_lock:
+        env = _active_environments.get(task_id)
+    if env is None:
+        return
+    try:
+        if hasattr(env, "cleanup"):
+            import inspect
+
+            sig = inspect.signature(env.cleanup)
+            if "force_remove" in sig.parameters:
+                env.cleanup(force_remove=force_remove)
+            else:
+                env.cleanup()
+        elif hasattr(env, "stop"):
+            env.stop()
+        elif hasattr(env, "terminate"):
+            env.terminate()
+        wait_for_result = getattr(env, "wait_for_cleanup_result", None)
+        if callable(wait_for_result):
+            wait_for_result()
+    except Exception:
+        logger.error(
+            "event=environment_cleanup stage=wait status=failed taskId=%s",
+            task_id,
+            exc_info=True,
+        )
+        raise
+    with _env_lock:
+        if _active_environments.get(task_id) is env:
+            _active_environments.pop(task_id, None)
+            _last_activity.pop(task_id, None)
+    with _creation_locks_lock:
+        _creation_locks.pop(task_id, None)
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache(task_id)
+    except ImportError:
+        pass
+    logger.info("Explicitly cleaned up environment for task: %s", task_id)
 
 
 def _atexit_cleanup():
@@ -2418,6 +2504,7 @@ def terminal_tool(
         # ``"default"``) is still found under its originating session id while
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
+        env_type = overrides.get("env_type") or env_type
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -2536,7 +2623,7 @@ def terminal_tool(
                     try:
                         ssh_config = _ssh_config_from_config(config) if env_type == "ssh" else None
                         container_config = (
-                            _container_config_from_config(config)
+                            _container_config_for_task(config, overrides)
                             if env_type in _CONTAINER_BACKENDS else None
                         )
 
@@ -3212,12 +3299,21 @@ def terminal_tool(
                         redact_terminal_output(strip_ansi(raw_spill), command),
                         encoding="utf-8", errors="replace",
                     )
+                    visible_spill_path = spill_file_path
+                    try:
+                        from tools.run_sandbox import workspace_visible_output_path
+                    except ImportError:
+                        workspace_visible_output_path = None
+                    if workspace_visible_output_path is not None:
+                        visible_spill_path = workspace_visible_output_path(
+                            effective_task_id or "", spill_file_path
+                        )
                     result_dict["output_total_chars"] = spill_total_chars
-                    result_dict["full_output_path"] = spill_file_path
+                    result_dict["full_output_path"] = visible_spill_path
                     result_dict["truncation_note"] = (
                         "Output exceeded the capture window (head+tail shown). "
                         f"Full output ({spill_total_chars:,} chars) saved to "
-                        f"{spill_file_path} — search it with search_files or page it "
+                        f"{visible_spill_path} — search it with search_files or page it "
                         "with read_file instead of re-running the command."
                     )
                 except Exception:

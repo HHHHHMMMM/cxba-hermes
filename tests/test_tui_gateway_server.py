@@ -1466,6 +1466,149 @@ def test_prompt_submit_longer_text_not_consumed_in_voice_mode(monkeypatch):
     assert resp.get("result") != {"voice_stopped": True}
 
 
+def test_prompt_submit_rejects_run_context_without_private_transport():
+    sid = "cxba-untrusted"
+    server._sessions[sid] = _session()
+    try:
+        response = server.handle_request({
+            "id": "run-untrusted",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "work", "run_context": {}},
+        })
+        assert response["error"]["code"] == 4031
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_prompt_submit_accepts_valid_run_context_from_private_transport(
+    tmp_path, monkeypatch
+):
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-trusted"
+    session = _session()
+    session["agent"] = object()
+    session["agent_ready"] = threading.Event()
+    session["agent_ready"].set()
+    session["cxba_binding"] = {
+        "case_id": "case-1",
+        "business_session_id": "session-1",
+        "business_branch_id": "branch-1",
+        "initial_context": {
+            "case_basic": {},
+            "global_master_links": [],
+            "material_catalog": [],
+        },
+    }
+    server._sessions[sid] = session
+    paths = {}
+    for name in ("data", "workspace", "session", "current", "shared"):
+        paths[name] = tmp_path / name
+        paths[name].mkdir()
+    run_context = {
+        "case_id": "case-1",
+        "business_session_id": "session-1",
+        "business_branch_id": "branch-1",
+        "run_id": "run-1",
+        "actor_user_id": "user-1",
+        "mounts": [
+            {"source": str(paths["data"]), "target": "/data", "read_only": True},
+            {"source": str(paths["workspace"]), "target": "/workspace", "read_only": False},
+            {"source": str(paths["session"]), "target": "/case-sessions/session-1", "read_only": True},
+            {"source": str(paths["current"]), "target": "/exchange/current", "read_only": False},
+            {"source": str(paths["shared"]), "target": "/shared", "read_only": True},
+        ],
+    }
+    captured = {}
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    authority = types.SimpleNamespace(cxba_private_authority=True)
+    token = bind_transport(authority)
+    try:
+        response = server.handle_request({
+            "id": "run-trusted",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "work", "run_context": run_context},
+        })
+        assert response["result"]["status"] == "streaming"
+        assert captured["trusted_run_context"].run_id == "run-1"
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_session_safe_stop_does_not_interrupt_running_tool():
+    class Agent:
+        def __init__(self):
+            self.safe_stop_calls = 0
+            self.interrupt_calls = 0
+
+        def request_safe_stop(self):
+            self.safe_stop_calls += 1
+            return True
+
+        def interrupt(self, *_args, **_kwargs):
+            self.interrupt_calls += 1
+
+    sid = "cxba-safe-stop"
+    session = _session()
+    session["running"] = True
+    session["agent"] = Agent()
+    session["queued_prompt"] = {"text": "must-not-run"}
+    session["queued_prompts"] = [{"text": "also-must-not-run"}]
+    server._sessions[sid] = session
+    try:
+        response = server._methods["session.safe_stop"](
+            "safe-stop", {"session_id": sid}
+        )
+        assert response["result"] == {
+            "status": "safe_stopping",
+            "control_outcome": "accepted",
+            "agent_ready": True,
+        }
+        assert session["agent"].safe_stop_calls == 1
+        assert session["agent"].interrupt_calls == 0
+        assert session["queued_prompt"] is None
+        assert "queued_prompts" not in session
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_session_safe_stop_reports_idle_control_outcome():
+    sid = "safe-stop-idle"
+    server._sessions[sid] = _session(running=False)
+    try:
+        response = server._methods["session.safe_stop"](
+            "safe-stop-idle", {"session_id": sid}
+        )
+        assert response["result"] == {
+            "status": "idle",
+            "control_outcome": "idle",
+        }
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatch):
     from tools import wake_word
 
@@ -2092,6 +2235,45 @@ def test_load_enabled_toolsets_all_env_means_all(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "all")
 
     assert server._load_enabled_toolsets() is None
+
+
+def test_load_enabled_toolsets_ignores_all_env_for_cxba_production(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", "all")
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"gateway": {"cxba_private_ws": {"token_env": "TEST_TOKEN"}}},
+    )
+
+    import agent.coding_context as coding_context
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(coding_context, "coding_selection", lambda **_: None)
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "platform_toolsets": {
+                "cli": [
+                    "terminal",
+                    "file",
+                    "code_execution",
+                    "delegation",
+                    "skills_readonly",
+                ]
+            },
+            "mcp_servers": {},
+        },
+    )
+
+    enabled = server._load_enabled_toolsets()
+
+    assert enabled is not None
+    assert {"memory", "session_search", "skills"}.isdisjoint(enabled)
+    assert {"terminal", "file", "code_execution", "delegation", "skills_readonly"} <= set(enabled)
+    assert "ignoring HERMES_TUI_TOOLSETS override" in capsys.readouterr().err
 
 
 def test_load_enabled_toolsets_all_env_warns_about_ignored_extra_entries(
@@ -4784,6 +4966,7 @@ def test_notification_poller_delivers_owned_events(
 def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
     class _ImmediateThread:
         def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
@@ -4866,6 +5049,483 @@ def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
         server._current_runtime_session_record.reset(record_token)
         reset_transport(transport_token)
         server._sessions.pop("sid-owner", None)
+
+
+def test_run_prompt_submit_uses_run_task_key_and_destroys_sandbox(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+    from tools.run_sandbox import (
+        TrustedRunContext,
+        RunMount,
+        current_run_sandbox_id,
+    )
+
+    observed = {}
+
+    class CapturingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, task_id=None, **kwargs):
+            observed["task_id"] = task_id
+            observed["bound_run_id"] = current_run_sandbox_id()
+            return super().run_conversation(prompt, **kwargs)
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    context = TrustedRunContext(
+        case_id="case-1",
+        business_session_id="session-1",
+        business_branch_id="branch-1",
+        run_id="run-finally-1",
+        actor_user_id="user-1",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    session = _session(
+        session_key="session-owner",
+        agent=CapturingAgent([]),
+        running=True,
+    )
+    server._sessions["sid-run-finally"] = session
+    try:
+        server._run_prompt_submit(
+            "rid-run-finally",
+            "sid-run-finally",
+            session,
+            "commission",
+            trusted_run_context=context,
+        )
+
+        assert observed == {
+            "task_id": "run-finally-1",
+            "bound_run_id": "run-finally-1",
+        }
+        assert "run-finally-1" not in terminal_tool._task_env_overrides
+        assert current_run_sandbox_id() is None
+    finally:
+        server._sessions.pop("sid-run-finally", None)
+
+
+def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
+    monkeypatch, tmp_path
+):
+    """Approval may be explained, but a safe-stopping Run cannot start more work."""
+    from tools import terminal_tool
+    from tools.run_sandbox import RunMount, TrustedRunContext, register_run_sandbox
+    from tui_gateway import cxba_runtime
+
+    emitted = []
+    safe_stop_calls = []
+
+    class _SafeStoppingAgent(_RecordingAgent):
+        def request_safe_stop(self):
+            safe_stop_calls.append(True)
+            return True
+
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "The approval result was received.",
+                "messages": [],
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    context = TrustedRunContext(
+        case_id="case-safe-stop",
+        business_session_id="business-session-safe-stop",
+        business_branch_id="branch-safe-stop",
+        run_id="run-safe-stop-approval",
+        actor_user_id="user-safe-stop",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    record, _created = cxba_runtime.attach_run(
+        run_context=context,
+        stored_session_id="stored-safe-stop",
+        runtime_session_id="sid-safe-stop",
+    )
+    register_run_sandbox(context)
+    cxba_runtime.mark_sandbox_registered(context.run_id)
+    cxba_runtime.observe_tool_result(
+        context.run_id,
+        {"proposal_id": "proposal-safe-stop", "status": "PENDING_APPROVAL"},
+    )
+    cxba_runtime.request_safe_stop(context.run_id)
+    cxba_runtime.mark_waiting_approval(context.run_id)
+    cxba_runtime.queue_approval_result(
+        context.run_id,
+        proposal_id="proposal-safe-stop",
+        status="APPROVED",
+        content={"executed": True},
+        pending_count=0,
+    )
+    turns = []
+    session = _session(
+        session_key="stored-safe-stop",
+        agent=_SafeStoppingAgent(turns),
+        running=True,
+        active_cxba_run_id=context.run_id,
+        _safe_stop_requested=True,
+    )
+    server._sessions["sid-safe-stop"] = session
+    try:
+        started = server._run_prompt_submit(
+            "rid-safe-stop",
+            "sid-safe-stop",
+            session,
+            "Trusted approval result",
+            trusted_run_context=context,
+            consumes_cxba_approvals=True,
+        )
+
+        assert started is True
+        assert safe_stop_calls == [True]
+        assert turns == ["Trusted approval result"]
+        assert record.status == "SAFE_STOPPED"
+        assert "active_cxba_run_id" not in session
+        assert context.run_id not in terminal_tool._task_env_overrides
+        continued = [payload for kind, _sid, payload in emitted if kind == "run.continued"]
+        assert continued == [{"status": "SAFE_STOPPING"}]
+        assert any(kind == "safe_stop.completed" for kind, _sid, _payload in emitted)
+    finally:
+        terminal_tool.clear_task_env_overrides(context.run_id)
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-safe-stop", None)
+
+
+def test_run_prompt_submit_marks_returned_error_run_failed(monkeypatch, tmp_path):
+    from tools import terminal_tool
+    from tools.run_sandbox import RunMount, TrustedRunContext
+    from tui_gateway import cxba_runtime
+
+    class _ReturnedErrorAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "",
+                "messages": [],
+                "error": "provider unavailable",
+                "failed": True,
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    context = TrustedRunContext(
+        case_id="case-error",
+        business_session_id="business-session-error",
+        business_branch_id="branch-error",
+        run_id="run-returned-error",
+        actor_user_id="user-error",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    turns = []
+    session = _session(
+        session_key="stored-error",
+        agent=_ReturnedErrorAgent(turns),
+        running=True,
+    )
+    server._sessions["sid-returned-error"] = session
+    try:
+        started = server._run_prompt_submit(
+            "rid-returned-error",
+            "sid-returned-error",
+            session,
+            "trigger provider failure",
+            trusted_run_context=context,
+        )
+
+        assert started is True
+        assert turns == ["trigger provider failure"]
+        assert cxba_runtime.get_run(context.run_id).status == "FAILED"
+        assert context.run_id not in terminal_tool._task_env_overrides
+        assert any(kind == "run.failed" for kind, _sid, _payload in emitted)
+    finally:
+        terminal_tool.clear_task_env_overrides(context.run_id)
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-returned-error", None)
+
+
+def test_run_prompt_submit_keeps_background_only_run_sandbox(monkeypatch, tmp_path):
+    from tools import terminal_tool
+    from tools.run_sandbox import (
+        RunMount,
+        TrustedRunContext,
+        destroy_run_sandbox,
+    )
+    from tui_gateway import cxba_runtime
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_cxba_run_has_background_work",
+        lambda _run_id, _sid, _session: True,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    context = TrustedRunContext(
+        case_id="case-background",
+        business_session_id="business-session-background",
+        business_branch_id="branch-background",
+        run_id="run-background-only",
+        actor_user_id="user-background",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    turns = []
+    session = _session(
+        session_key="stored-background",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    server._sessions["sid-background-only"] = session
+    try:
+        started = server._run_prompt_submit(
+            "rid-background-only",
+            "sid-background-only",
+            session,
+            "delegate work",
+            trusted_run_context=context,
+        )
+
+        assert started is True
+        assert turns == ["delegate work"]
+        assert cxba_runtime.get_run(context.run_id).status == "RUNNING"
+        assert context.run_id in terminal_tool._task_env_overrides
+        assert any(kind == "run.background" for kind, _sid, _payload in emitted)
+        assert not any(
+            kind in {"run.completed", "run.waiting_approval"}
+            for kind, _sid, _payload in emitted
+        )
+    finally:
+        if context.run_id in terminal_tool._task_env_overrides:
+            destroy_run_sandbox(context.run_id)
+        cxba_runtime.detach_completed_run(context.run_id, "COMPLETED")
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-background-only", None)
+
+
+def _assert_cxba_retention_probe_failure_keeps_run(
+    monkeypatch, tmp_path, caplog, *, run_id, configure_failure
+):
+    from tools import terminal_tool
+    from tools.run_sandbox import RunMount, TrustedRunContext, destroy_run_sandbox
+    from tui_gateway import cxba_runtime
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    configure_failure(cxba_runtime)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    context = TrustedRunContext(
+        case_id="case-retention-probe",
+        business_session_id="business-session-retention-probe",
+        business_branch_id="branch-retention-probe",
+        run_id=run_id,
+        actor_user_id="user-retention-probe",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    session = _session(
+        session_key=f"stored-{run_id}",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+    sid = f"sid-{run_id}"
+    server._sessions[sid] = session
+    try:
+        started = server._run_prompt_submit(
+            f"rid-{run_id}",
+            sid,
+            session,
+            "inspect retention state",
+            trusted_run_context=context,
+        )
+
+        assert started is True
+        record = cxba_runtime.get_run(run_id)
+        assert record is not None
+        assert record.status == "UNREACHABLE"
+        assert record.sandbox_registered is True
+        assert run_id in terminal_tool._task_env_overrides
+        kinds = [kind for kind, _sid, _payload in emitted]
+        assert "heartbeat.lost" in kinds
+        assert "run.diagnostic" in kinds
+        assert not any(
+            kind in {"sandbox.stopped", "run.completed", "run.failed", "run.background"}
+            for kind in kinds
+        )
+        assert "event=cxba_sandbox_retention stage=probe status=failed" in caplog.text
+    finally:
+        if run_id in terminal_tool._task_env_overrides:
+            destroy_run_sandbox(run_id)
+        cxba_runtime.detach_completed_run(run_id, "FAILED")
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop(sid, None)
+
+
+def test_pending_approval_probe_failure_keeps_sandbox_unreachable(
+    monkeypatch, tmp_path, caplog
+):
+    def configure_failure(cxba_runtime):
+        def fail_pending(_run_id):
+            raise RuntimeError("synthetic pending proposal probe failure")
+
+        monkeypatch.setattr(cxba_runtime, "has_pending_proposals", fail_pending)
+
+    _assert_cxba_retention_probe_failure_keeps_run(
+        monkeypatch,
+        tmp_path,
+        caplog,
+        run_id="run-pending-probe-failure",
+        configure_failure=configure_failure,
+    )
+
+
+def test_active_delegation_probe_failure_keeps_sandbox_unreachable(
+    monkeypatch, tmp_path, caplog
+):
+    from tools import async_delegation
+
+    def configure_failure(_cxba_runtime):
+        def fail_delegation(**_kwargs):
+            raise RuntimeError("synthetic delegation probe failure")
+
+        monkeypatch.setattr(async_delegation, "has_live_for_session", fail_delegation)
+
+    _assert_cxba_retention_probe_failure_keeps_run(
+        monkeypatch,
+        tmp_path,
+        caplog,
+        run_id="run-delegation-probe-failure",
+        configure_failure=configure_failure,
+    )
+
+
+def test_run_prompt_submit_keeps_undelivered_approval_result_running(
+    monkeypatch, tmp_path
+):
+    """An earlier ordinary queued turn must not consume or strand a later approval."""
+    from tools import terminal_tool
+    from tools.run_sandbox import (
+        RunMount,
+        TrustedRunContext,
+        destroy_run_sandbox,
+        register_run_sandbox,
+    )
+    from tui_gateway import cxba_runtime
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    context = TrustedRunContext(
+        case_id="case-approval-delivery",
+        business_session_id="business-session-approval-delivery",
+        business_branch_id="branch-approval-delivery",
+        run_id="run-approval-delivery",
+        actor_user_id="user-approval-delivery",
+        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+    )
+    record, _created = cxba_runtime.attach_run(
+        run_context=context,
+        stored_session_id="stored-approval-delivery",
+        runtime_session_id="sid-approval-delivery",
+    )
+    register_run_sandbox(context)
+    cxba_runtime.mark_sandbox_registered(context.run_id)
+    cxba_runtime.observe_tool_result(
+        context.run_id,
+        {"proposal_id": "proposal-delivery", "status": "PENDING_APPROVAL"},
+    )
+    cxba_runtime.queue_approval_result(
+        context.run_id,
+        proposal_id="proposal-delivery",
+        status="EXECUTED",
+        content={"affected_rows": 1},
+        pending_count=0,
+    )
+    turns = []
+    session = _session(
+        session_key="stored-approval-delivery",
+        agent=_RecordingAgent(turns),
+        running=True,
+        active_cxba_run_id=context.run_id,
+    )
+    server._sessions["sid-approval-delivery"] = session
+    try:
+        started = server._run_prompt_submit(
+            "rid-ordinary-before-approval",
+            "sid-approval-delivery",
+            session,
+            "ordinary queued message",
+            trusted_run_context=context,
+        )
+
+        assert started is True
+        assert turns == ["ordinary queued message"]
+        assert record.status == "RUNNING"
+        assert cxba_runtime.has_undelivered_approval_results(context.run_id) is True
+        assert context.run_id in terminal_tool._task_env_overrides
+        assert any(
+            kind == "run.continuation_queued" and payload["status"] == "RUNNING"
+            for kind, _sid, payload in emitted
+        )
+        assert not any(kind == "run.waiting_approval" for kind, _sid, _payload in emitted)
+    finally:
+        if context.run_id in terminal_tool._task_env_overrides:
+            destroy_run_sandbox(context.run_id)
+        cxba_runtime.detach_completed_run(context.run_id, "COMPLETED")
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-approval-delivery", None)
 
 
 class _RecordingAgent:
@@ -8743,9 +9403,41 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
 
     assert "result" in resp, resp
     assert resp["result"]["status"] == "queued"
+    assert resp["result"]["control_outcome"] == "accepted"
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt
+
+
+def test_session_steer_preserves_native_rejected_status_with_stable_outcome():
+    session = _session(agent=types.SimpleNamespace(steer=lambda _text: False))
+    session["running"] = True
+    server._sessions["sid"] = session
+    try:
+        rejected = server.handle_request(
+            {
+                "id": "steer-rejected",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "new direction"},
+            }
+        )
+        assert rejected["result"] == {
+            "status": "rejected",
+            "control_outcome": "rejected",
+            "text": "new direction",
+        }
+        session["running"] = False
+        idle = server.handle_request(
+            {
+                "id": "steer-idle",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "new direction"},
+            }
+        )
+        assert idle["result"]["status"] == "rejected"
+        assert idle["result"]["control_outcome"] == "idle"
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_session_steer_rejects_empty_text():
@@ -8807,6 +9499,7 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
 
     assert resp["result"] == {
         "status": "redirected",
+        "control_outcome": "accepted",
         "text": "use Postgres",
     }
     assert calls == ["use Postgres"]
@@ -8878,8 +9571,46 @@ def test_session_redirect_queues_during_agent_build_window(monkeypatch):
     finally:
         server._sessions.pop("sid", None)
 
-    assert resp["result"] == {"status": "queued", "text": "wait, use SQLite"}
+    assert resp["result"] == {
+        "status": "queued",
+        "control_outcome": "accepted",
+        "text": "wait, use SQLite",
+    }
     assert session["queued_prompt"]["text"] == "wait, use SQLite"
+
+
+def test_session_redirect_preserves_native_rejected_status_with_stable_outcome():
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=lambda _text: False,
+    )
+    session = _session(agent=agent, running=True)
+    server._sessions["sid"] = session
+    try:
+        rejected = server.handle_request(
+            {
+                "id": "redirect-rejected",
+                "method": "session.redirect",
+                "params": {"session_id": "sid", "text": "new direction"},
+            }
+        )
+        assert rejected["result"] == {
+            "status": "rejected",
+            "control_outcome": "rejected",
+            "text": "new direction",
+        }
+        session["running"] = False
+        idle = server.handle_request(
+            {
+                "id": "redirect-idle",
+                "method": "session.redirect",
+                "params": {"session_id": "sid", "text": "new direction"},
+            }
+        )
+        assert idle["result"]["status"] == "rejected"
+        assert idle["result"]["control_outcome"] == "idle"
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_session_redirect_rejects_when_idle_without_agent(monkeypatch):
@@ -9680,6 +10411,40 @@ def test_interrupt_clears_multiple_own_pending():
         for key in ("r1", "r2"):
             server._pending.pop(key, None)
             server._answers.pop(key, None)
+
+
+def test_session_interrupt_reports_accepted_and_idle_control_outcomes():
+    class Agent:
+        def interrupt(self, *_args, **_kwargs):
+            return None
+
+    session = _session(agent=Agent(), running=True)
+    server._sessions["sid"] = session
+    try:
+        accepted = server.handle_request(
+            {
+                "id": "interrupt-running",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+        assert accepted["result"] == {
+            "status": "interrupted",
+            "control_outcome": "accepted",
+        }
+        idle = server.handle_request(
+            {
+                "id": "interrupt-idle",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+        assert idle["result"] == {
+            "status": "interrupted",
+            "control_outcome": "idle",
+        }
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
@@ -11653,7 +12418,11 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
 
     parent = {
         "session_key": "parent-key",
-        "history": [{"role": "user", "content": "hi"}],
+        "history": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "later message"},
+        ],
         "history_lock": __import__("threading").Lock(),
         "running": False,
         "cols": 80,
@@ -11685,7 +12454,12 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             {
                 "id": "1",
                 "method": "session.branch",
-                "params": {"session_id": "parent", "name": "forked"},
+                "params": {
+                    "session_id": "parent",
+                    "name": "forked",
+                    "target_message_index": 1,
+                    "edited_content": "edited answer",
+                },
             }
         )
         assert "result" in resp, resp
@@ -11695,7 +12469,11 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         # profile, not left NULL for aggregators to mis-tag as "default".
         assert seen.get("profile_name") == "mlperf"
         assert seen.get("title") == (seen["created"], "forked")
-        assert len(seen["msgs"]) == 1
+        assert [message["content"] for message in seen["msgs"]] == [
+            "hi",
+            "edited answer",
+        ]
+        assert resp["result"]["message_count"] == 2
         assert seen.get("launch") is None
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]

@@ -790,7 +790,8 @@ def _get_or_create_env(task_id: str):
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _resolve_container_task_id, _container_config_for_task,
+        resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -799,7 +800,12 @@ def _get_or_create_env(task_id: str):
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            config = _get_env_config()
+            overrides = resolve_task_overrides(task_id)
+            return (
+                _active_environments[effective_task_id],
+                overrides.get("env_type") or config["env_type"],
+            )
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -811,11 +817,17 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+                config = _get_env_config()
+                overrides = resolve_task_overrides(task_id)
+                return (
+                    _active_environments[effective_task_id],
+                    overrides.get("env_type") or config["env_type"],
+                )
 
         config = _get_env_config()
         env_type = config["env_type"]
         overrides = _task_env_overrides.get(effective_task_id, {})
+        env_type = overrides.get("env_type") or env_type
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -832,16 +844,7 @@ def _get_or_create_env(task_id: str):
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "vercel_runtime": config.get("vercel_runtime", ""),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_network": config.get("docker_network", True),
-            }
+            container_config = _container_config_for_task(config, overrides)
 
         ssh_config = None
         if env_type == "ssh":
@@ -1281,9 +1284,16 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _get_env_config,
+        _docker_has_host_access,
+        resolve_task_overrides,
+    )
     _env_config = _get_env_config()
-    env_type = _env_config["env_type"]
+    _task_overrides = resolve_task_overrides(task_id)
+    env_type = _task_overrides.get("env_type") or _env_config["env_type"]
+    _guard_env_config = dict(_env_config)
+    _guard_env_config.update(_task_overrides)
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
@@ -1294,7 +1304,7 @@ def execute_code(
     from tools.approval import check_execute_code_guard
     _guard = check_execute_code_guard(
         code, env_type,
-        has_host_access=_docker_has_host_access(_env_config),
+        has_host_access=_docker_has_host_access(_guard_env_config),
     )
     if not _guard.get("approved", False):
         return json.dumps({

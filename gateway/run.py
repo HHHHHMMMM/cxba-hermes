@@ -93,6 +93,18 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _platform_context_policy(user_config: dict, platform_key: str) -> tuple[bool, bool]:
+    """Resolve per-platform context loading with upstream-compatible defaults."""
+    platforms = (user_config.get("gateway") or {}).get("platforms") or {}
+    platform_cfg = platforms.get(platform_key) or {}
+    skip_raw = platform_cfg.get("skip_context_files")
+    soul_raw = platform_cfg.get("load_soul_identity")
+    return (
+        bool(skip_raw) if skip_raw is not None else False,
+        bool(soul_raw) if soul_raw is not None else True,
+    )
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -4595,10 +4607,9 @@ class TurnRunner:
         # impactful on Windows, where stat() + directory walks are 10-100x
         # slower than Linux. Off by default; soul identity is preserved so
         # the persona survives even with minimal context.
-        _platforms_gw_cfg = (ctx.user_config.get("gateway") or {}).get("platforms") or {}
-        _plat_gw_cfg = _platforms_gw_cfg.get(platform_key) or {}
-        _skip_context = _plat_gw_cfg.get("skip_context_files")
-        skip_context_files = bool(_skip_context) if _skip_context is not None else False
+        skip_context_files, load_soul_identity = _platform_context_policy(
+            ctx.user_config, platform_key
+        )
 
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
@@ -4612,6 +4623,7 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            load_soul_identity=load_soul_identity,
         )
         agent = None
         reused_cached_agent = False
@@ -4850,7 +4862,7 @@ class TurnRunner:
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
-                load_soul_identity=True,
+                load_soul_identity=load_soul_identity,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -22938,6 +22950,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         skip_context_files: bool = False,
+        load_soul_identity: bool = True,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -22996,6 +23009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (context files in vs out) — a toggled config edit must
                 # rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
+                bool(load_soul_identity),
             ],
             sort_keys=True,
             default=str,

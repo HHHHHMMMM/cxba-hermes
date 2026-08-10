@@ -27,6 +27,8 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import hmac
+import os
 import socket
 import threading
 from typing import Any
@@ -67,6 +69,21 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _has_cxba_private_token(ws: Any) -> bool:
+    """Authenticate the private Spring connection at WebSocket handshake."""
+    expected_token = os.getenv("CXBA_GATEWAY_PRIVATE_TOKEN", "")
+    supplied_token = ""
+    try:
+        supplied_token = str(ws.headers.get("x-cxba-gateway-token") or "")
+    except Exception:
+        pass
+    return bool(
+        len(expected_token) >= 32
+        and supplied_token
+        and hmac.compare_digest(supplied_token, expected_token)
+    )
+
+
 class WSTransport:
     """Per-connection WS transport.
 
@@ -89,10 +106,12 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        cxba_private_authority: bool = False,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self.cxba_private_authority = bool(cxba_private_authority)
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -301,7 +320,12 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            cxba_private_authority=_has_cxba_private_token(ws),
+        )
 
         # resolve_skin() reads config + initializes the skin engine —
         # synchronous I/O + CPU work that should not block the event loop

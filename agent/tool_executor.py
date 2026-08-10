@@ -53,6 +53,89 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _cxba_tool_log_context(effective_task_id: str) -> dict[str, str] | None:
+    """Return trusted CXBA identifiers for content-free production logging."""
+    if not effective_task_id or effective_task_id == "default":
+        return None
+    try:
+        from tools.run_sandbox import current_run_sandbox_id
+    except ImportError:
+        return None
+    if current_run_sandbox_id() != effective_task_id:
+        return None
+    try:
+        from tui_gateway.cxba_runtime import get_run
+
+        run = get_run(effective_task_id)
+    except Exception:
+        # The trusted Run ContextVar is the confidentiality boundary.  A
+        # diagnostic registry lookup failure must not fall back to logging raw
+        # tool output from an active case Run.
+        run = None
+    return {
+        "run_id": run.run_id if run is not None else effective_task_id,
+        "stored_session_id": run.stored_session_id if run is not None else "unavailable",
+        "runtime_session_id": run.runtime_session_id if run is not None else "unavailable",
+    }
+
+
+def _log_tool_exception(
+    *,
+    agent,
+    effective_task_id: str,
+    function_name: str,
+    error: BaseException,
+    source: str,
+) -> None:
+    context = _cxba_tool_log_context(effective_task_id)
+    if context is None:
+        logger.error(
+            "%s raised for %s: %s", source, function_name, error, exc_info=True
+        )
+        return
+    logger.error(
+        "event=cxba_tool stage=execute status=failed runId=%s "
+        "storedSessionId=%s runtimeSessionId=%s tool=%s errorType=%s",
+        context["run_id"],
+        context["stored_session_id"],
+        context["runtime_session_id"],
+        function_name,
+        type(error).__name__,
+    )
+
+
+def _log_tool_outcome(
+    *,
+    agent,
+    effective_task_id: str,
+    function_name: str,
+    duration: float,
+    result: Any,
+    failed: bool,
+) -> bool:
+    """Log a CXBA outcome without material content; return whether handled."""
+    context = _cxba_tool_log_context(effective_task_id)
+    if context is None:
+        return False
+    try:
+        result_chars = len(result) if isinstance(result, (str, bytes)) else len(str(result))
+    except Exception:
+        result_chars = 0
+    log_method = logger.warning if failed else logger.info
+    log_method(
+        "event=cxba_tool stage=complete status=%s runId=%s storedSessionId=%s "
+        "runtimeSessionId=%s tool=%s durationMs=%d resultChars=%d",
+        "failed" if failed else "completed",
+        context["run_id"],
+        context["stored_session_id"],
+        context["runtime_session_id"],
+        function_name,
+        int(duration * 1000),
+        result_chars,
+    )
+    return True
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -665,13 +748,16 @@ def _begin_tool_execution(
     display_index: int | None,
 ) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
+    cxba_log_context = _cxba_tool_log_context(effective_task_id)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         display_args = (
             _redact_tool_args_for_display(function_name, function_args) or function_args
         )
         args_str = json.dumps(display_args, ensure_ascii=False)
         prefix = f"Tool {display_index}" if display_index is not None else "Tool"
-        if agent.verbose_logging:
+        if cxba_log_context is not None:
+            print(f"  📞 {prefix}: {function_name}")
+        elif agent.verbose_logging:
             print(f"  📞 {prefix}: {function_name}({list(display_args.keys())})")
             print(
                 agent._wrap_verbose(
@@ -1089,7 +1175,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_tool_exception(
+                    agent=agent,
+                    effective_task_id=effective_task_id,
+                    function_name=function_name,
+                    error=tool_error,
+                    source="invoke_tool",
+                )
             duration = time.time() - start
             if not blocked and not dispatched:
                 _emit_terminal_post_tool_call(
@@ -1103,10 +1195,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             is_error, _ = _detect_tool_failure(function_name, result)
-            if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
-            else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            if not _log_tool_outcome(
+                agent=agent,
+                effective_task_id=effective_task_id,
+                function_name=function_name,
+                duration=duration,
+                result=result,
+                failed=is_error,
+            ):
+                if is_error:
+                    logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                else:
+                    logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (
                 function_name,
                 function_args,
@@ -1435,7 +1535,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     failed=is_error,
                 )
 
-            if is_error:
+            cxba_outcome_logged = _log_tool_outcome(
+                agent=agent,
+                effective_task_id=effective_task_id,
+                function_name=function_name,
+                duration=tool_duration,
+                result=function_result,
+                failed=is_error,
+            )
+            if is_error and not cxba_outcome_logged:
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -1451,7 +1559,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if agent.verbose_logging:
+            if agent.verbose_logging and not cxba_outcome_logged:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
@@ -1522,7 +1630,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             agent._safe_print(f"  {cute_msg}")
         elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             _preview_str = _multimodal_text_summary(display_function_result)
-            if agent.verbose_logging:
+            if agent.verbose_logging and _cxba_tool_log_context(effective_task_id) is None:
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
                 print(agent._wrap_verbose("Result: ", _preview_str))
             else:
@@ -1608,15 +1716,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
-        if agent._interrupt_requested:
+        _safe_stop_event = vars(agent).get("_safe_stop_requested")
+        _safe_stop = bool(
+            _safe_stop_event is not None and _safe_stop_event.is_set()
+        )
+        if agent._interrupt_requested or _safe_stop:
             remaining_calls = assistant_message.tool_calls[i-1:]
             if remaining_calls:
-                agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
+                reason_label = "safe stop" if _safe_stop else "interrupt"
+                agent._vprint(
+                    f"{agent.log_prefix}⚡ {reason_label}: skipping "
+                    f"{len(remaining_calls)} tool call(s)",
+                    force=True,
+                )
             for skipped_tc in remaining_calls:
                 skipped_name = skipped_tc.function.name
                 cancelled_result = (
                     f"[Tool execution cancelled — {skipped_name} was skipped "
-                    "due to user interrupt]"
+                    f"due to user {'safe stop' if _safe_stop else 'interrupt'}]"
                 )
                 messages.append(make_tool_result_message(
                     skipped_name,
@@ -1632,8 +1749,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(skipped_tc, "id", "") or "",
                     status="cancelled",
-                    error_type="user_interrupt",
-                    error_message="Tool execution skipped due to user interrupt",
+                    error_type="user_safe_stop" if _safe_stop else "user_interrupt",
+                    error_message=(
+                        "Tool execution skipped due to user safe stop"
+                        if _safe_stop
+                        else "Tool execution skipped due to user interrupt"
+                    ),
                 )
                 if not _flush_session_db_after_tool_progress(
                     agent,
@@ -2064,7 +2185,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_tool_exception(
+                    agent=agent,
+                    effective_task_id=effective_task_id,
+                    function_name=function_name,
+                    error=tool_error,
+                    source="handle_function_call",
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -2191,10 +2318,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
-        if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-        else:
-            logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        cxba_outcome_logged = _log_tool_outcome(
+            agent=agent,
+            effective_task_id=effective_task_id,
+            function_name=function_name,
+            duration=tool_duration,
+            result=function_result,
+            failed=_is_error_result,
+        )
+        if not cxba_outcome_logged:
+            if _is_error_result:
+                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            else:
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed
@@ -2212,7 +2348,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if _is_error_result else ""
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
-        if agent.verbose_logging:
+        if agent.verbose_logging and not cxba_outcome_logged:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
@@ -2292,7 +2428,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logging.debug("Tool output risk callback error: %s", cb_err)
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            if agent.verbose_logging:
+            if _cxba_tool_log_context(effective_task_id) is not None:
+                print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
+            elif agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
                 print(agent._wrap_verbose("Result: ", function_result))
             else:

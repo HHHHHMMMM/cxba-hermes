@@ -1,0 +1,62 @@
+model:
+  provider: custom
+  default: "${env:CXBA_LOCAL_MODEL}"
+  base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
+
+fallback_providers: []
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  nudge_interval: 0
+  flush_min_turns: 0
+
+curator:
+  enabled: false
+  consolidate: false
+
+skills:
+  inline_shell: false
+
+terminal:
+  backend: docker
+  cwd: /workspace
+  docker_image: cxba-hermes-sandbox:local
+  docker_network: true
+  docker_mount_cwd_to_workspace: false
+  container_persistent: false
+
+agent:
+  disabled_toolsets:
+    - memory
+    - session_search
+    - skills_hub
+    - cronjob
+    - web
+    - browser
+    - image_gen
+
+platform_toolsets:
+  cli: [terminal, file, code_execution, delegation, skills_readonly]
+  api_server: [terminal, file, code_execution, delegation, skills_readonly]
+  webhook: [terminal, file, code_execution, delegation, skills_readonly]
+
+gateway:
+  case_storage_root: "${env:CXBA_CASE_STORAGE_ROOT}"
+  cxba_private_ws:
+    token_env: CXBA_GATEWAY_PRIVATE_TOKEN
+  platforms:
+    api_server:
+      skip_context_files: true
+      load_soul_identity: false
+    webhook:
+      skip_context_files: true
+      load_soul_identity: false
+
+mcp_servers:
+  cxba_spring:
+    url: "${env:CXBA_SPRING_MCP_URL}"
+    trust_env: false
+    headers:
+      Authorization: "Bearer ${env:CXBA_SPRING_MCP_TOKEN}"
+    cxba_trusted_context: true

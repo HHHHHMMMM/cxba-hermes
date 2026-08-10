@@ -1931,6 +1931,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_dropped_toolcall_nudge",
+    "_stream_recovery_synthetic",
 )
 
 
@@ -2145,6 +2146,25 @@ def finalize_context_engine_compression_notification(
     if not committed or not callable(pending):
         return False
     return bool(pending())
+
+
+def _compression_child_model_config(agent: Any, parent_session_id: str) -> dict:
+    """Carry trusted host metadata to Hermes' official continuation row."""
+    child_model_config = dict(
+        getattr(agent, "_session_init_model_config", None) or {}
+    )
+    finder = getattr(getattr(agent, "_session_db", None), "get_session", None)
+    if not callable(finder):
+        return child_model_config
+    from tui_gateway.cxba_runtime import binding_from_model_config
+
+    parent_row = finder(parent_session_id)
+    parent_binding = binding_from_model_config(
+        parent_row.get("model_config") if parent_row else None
+    )
+    if parent_binding is not None:
+        child_model_config["_cxba_binding"] = parent_binding
+    return child_model_config
 
 
 def compress_context(
@@ -3283,6 +3303,9 @@ def compress_context(
                         _profile_for_child = None
                     old_title = agent._session_db.get_session_title(agent.session_id)
                     old_session_id = agent.session_id
+                    child_model_config = _compression_child_model_config(
+                        agent, old_session_id
+                    )
                     new_session_id = (
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
@@ -3293,7 +3316,7 @@ def compress_context(
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
-                        model_config=agent._session_init_model_config,
+                        model_config=child_model_config,
                         system_prompt=new_system_prompt,
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),
@@ -3302,6 +3325,7 @@ def compress_context(
                         require_compression_lease=_lock_holder is not None,
                     )
                     agent.session_id = new_session_id
+                    agent._session_init_model_config = child_model_config
                     try:
                         from gateway.session_context import set_current_session_id
 

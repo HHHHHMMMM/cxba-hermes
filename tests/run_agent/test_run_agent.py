@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3817,6 +3820,44 @@ class TestRunConversation:
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
+    def test_network_stream_drop_discards_partial_text_and_recovers_from_state(self, agent):
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        first = _mock_response(
+            content="I will now repeat the entire investigation plan",
+            finish_reason="length",
+        )
+        first.id = PARTIAL_STREAM_STUB_ID
+        second = _mock_response(content="Recovered from durable state.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+        events = []
+        agent.event_callback = lambda event_type, payload: events.append((event_type, payload))
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the investigation")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered from durable state."
+        second_call_messages = (
+            agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        )
+        assert second_call_messages[-2]["content"].endswith(
+            "its partial response was discarded."
+        )
+        assert all(
+            "repeat the entire investigation plan" not in str(message.get("content") or "")
+            for message in second_call_messages
+        )
+        assert [event_type for event_type, _payload in events] == [
+            "draft.discarded",
+            "recovery.started",
+        ]
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
@@ -5706,15 +5747,19 @@ class TestAnthropicInterruptHandler:
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
-            provider="anthropic",
-            model="claude-test",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        with patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=MagicMock(),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
         agent.api_mode = "anthropic_messages"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()

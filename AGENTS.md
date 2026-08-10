@@ -1,3 +1,32 @@
+# CXBA Hermes Repository Rules
+
+本仓库是 CXBA 案件工作台自有的 Hermes 项目仓库，以下规则优先约束本项目开发；后文完整保留 Hermes 官方开发指南并继续适用。
+
+## 1. 原生优先与职责边界
+
+- 能用 Hermes 原生 Gateway、Session、工具、Skill、Sandbox、Checkpoint 和事件能力完成的需求，必须先复用原生能力；只有经过实际代码核对确认原生能力不足，才允许做最小范围扩展。
+- Spring Boot/Vue 负责案件、成员权限、全局主档、业务审批、案件与 Session/Run 关联、运行状态展示、疑点线索和文件视图；Hermes 负责自主调查、对话连续性、工具编排、子 Agent 和 Run Sandbox。
+- Hermes 不得直连或绕过 Spring 写 CXBA PostgreSQL 业务表。业务写入必须调用 Spring 提供的受信工具接口，并遵守人工确认结果。
+- 案件、用户、Session 和 Run 的可信绑定由控制面注入；模型文本或工具参数中的自报身份不得作为权限依据。
+
+## 2. 实现纪律
+
+- 子任务遇到规格未说明、现有实现冲突或多种方案会改变业务结果时，必须报告主控 Agent，由主控确认后继续；不得自行猜测。
+- 严禁为 CXBA 业务新增内容哈希、审批冻结、数据版本、乐观锁版本、幂等键、CAS、重复请求门禁或换名后的同类机制。需要保证审批原子性时，只使用既有提案状态和 Spring 数据库事务。
+- 上述禁令只约束本项目新增和修改的 CXBA 能力；Hermes 上游已有且与本次 CXBA 业务无关的哈希或框架机制保持原样，不为清理它们扩大改造范围。
+- 不得把持久化实测仓库的脏工作树整体复制进来。每项补丁、Skill 或运行配置都要先核对原生实现，再独立迁移并测试。
+- 不得提交 `.env`、Token、模型密钥、`state.db`、真实案件材料、案件 Workspace、日志、缓存、实测对话或包含真实业务值的测试夹具。
+- 所有运行依赖预装到镜像；生产运行不得临时从公网或不存在的内网源安装 Python、npm 或系统包。
+
+## 3. 验证与交付
+
+- Python 测试必须使用官方 `scripts/run_tests.sh`，不得直接调用 `pytest`。
+- 修改 Gateway、SessionDB、Sandbox、工具结果或审批续跑链路时，必须覆盖真实入口和失败路径；仅有 mock 单元测试不算完成。
+- 主控 Agent 必须复核子任务 diff 并实际运行与风险相称的测试后，才能在 OpenSpec 中勾选任务。
+- 任何新增日志不得记录完整对话、工具原始结果、案件材料内容或个人敏感信息。
+
+---
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.

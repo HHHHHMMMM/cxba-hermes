@@ -1,0 +1,14 @@
+{
+  "materials": [
+    {
+      "materialId": "synthetic-table",
+      "relativePath": "tables/transactions.csv",
+      "displayName": "Synthetic transactions"
+    },
+    {
+      "materialId": "synthetic-document",
+      "relativePath": "documents/note.txt",
+      "displayName": "Synthetic note"
+    }
+  ]
+}

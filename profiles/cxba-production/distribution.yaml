@@ -1,0 +1,10 @@
+name: cxba-production
+description: "Production CXBA case investigation profile"
+hermes_requires: ">=0.20.0"
+author: "CXBA Project Team"
+license: "MIT"
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - skills
+  - distribution.yaml

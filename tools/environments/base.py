@@ -957,8 +957,18 @@ class BaseEnvironment(ABC):
             # Foreground terminal path: tee overflow to a spill file so a
             # truncated result is recoverable without re-running (the file
             # only gets created if output actually exceeds the cap).
+            spill_dir = None
+            run_id = str(getattr(self, "_task_id", "") or "")
+            if run_id and run_id != "default":
+                from tools.run_sandbox import workspace_output_directory
+
+                # Trusted CXBA output setup is security-sensitive.  Do not
+                # silently fall back to an unmounted host cache when its
+                # controlled directory cannot be validated.
+                spill_dir = workspace_output_directory(run_id)
             try:
-                spill_dir = get_hermes_home() / "cache" / "terminal-output"
+                if spill_dir is None:
+                    spill_dir = get_hermes_home() / "cache" / "terminal-output"
                 spill_path = spill_dir / f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
                 # Opportunistic cleanup of spills older than 7 days.
                 if spill_dir.is_dir():
@@ -970,6 +980,8 @@ class BaseEnvironment(ABC):
                         except OSError:
                             pass
             except Exception:
+                if run_id and spill_dir is not None:
+                    raise
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
@@ -1112,6 +1124,25 @@ class BaseEnvironment(ABC):
         # reports without reproducing locally.
         _tid = threading.current_thread().ident
         _pid = getattr(proc, "pid", None)
+        _cxba_run_id = str(getattr(self, "_task_id", "") or "")
+
+        def _record_cxba_tool_heartbeat(alive: bool) -> None:
+            if not _cxba_run_id or _cxba_run_id == "default":
+                return
+            try:
+                from tools.run_sandbox import record_tool_process_heartbeat
+
+                record_tool_process_heartbeat(_cxba_run_id, alive)
+            except Exception as exc:
+                logger.warning(
+                    "event=cxba_tool_heartbeat stage=record status=failed "
+                    "runId=%s errorType=%s",
+                    _cxba_run_id,
+                    type(exc).__name__,
+                )
+
+        _record_cxba_tool_heartbeat(True)
+        _last_cxba_tool_heartbeat = _now
         _iter_count = 0
         _last_heartbeat = _now
         _last_interrupt_state = False
@@ -1129,6 +1160,14 @@ class BaseEnvironment(ABC):
             _poll_sleep = 0.005
             while proc.poll() is None:
                 _iter_count += 1
+                _heartbeat_now = time.monotonic()
+                if (
+                    _cxba_run_id
+                    and _cxba_run_id != "default"
+                    and _heartbeat_now - _last_cxba_tool_heartbeat >= 2.0
+                ):
+                    _record_cxba_tool_heartbeat(True)
+                    _last_cxba_tool_heartbeat = _heartbeat_now
                 if is_interrupted():
                     if _DEBUG_INTERRUPT:
                         logger.info(
@@ -1138,6 +1177,7 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    _record_cxba_tool_heartbeat(False)
                     return self._finalize_wait_result(
                         output,
                         output.render(suffix="\n[Command interrupted]"),
@@ -1152,6 +1192,7 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    _record_cxba_tool_heartbeat(False)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return self._finalize_wait_result(
                         output,
@@ -1212,6 +1253,7 @@ class BaseEnvironment(ABC):
                 drain_thread.join(timeout=2)
             except Exception:
                 pass  # cleanup is best-effort
+            _record_cxba_tool_heartbeat(False)
             raise
 
         # Drain thread now exits promptly after bash does (~300ms idle
@@ -1233,6 +1275,7 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
+        _record_cxba_tool_heartbeat(False)
         return self._finalize_wait_result(output, output.render(), proc.returncode)
 
     @staticmethod

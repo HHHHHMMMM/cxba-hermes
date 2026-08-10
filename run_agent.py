@@ -233,6 +233,10 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 # turns as if they were genuine context.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_recovery_synthetic",
+    # Provider stream interruption recovery inserts an assistant notice plus
+    # a user nudge to drive the retry.  Both are runtime-only scaffolding: the
+    # real audit trail is carried by draft.discarded/recovery.started events.
+    "_stream_recovery_synthetic",
     "_empty_terminal_sentinel",
     "_thinking_prefill",
     # verify-on-stop and pre_verify nudges append a synthetic user nudge to
@@ -3191,6 +3195,24 @@ class AIAgent:
         # legacy interrupt(message=None) ABI may override interrupt without the
         # newer keyword-only hard_cancel argument.
         AIAgent.interrupt(self, message, hard_cancel=True)
+
+    def request_safe_stop(self) -> bool:
+        """Stop after the currently running tool is durably recorded."""
+        event = getattr(self, "_safe_stop_requested", None)
+        if event is None:
+            event = threading.Event()
+            self._safe_stop_requested = event
+        event.set()
+        return True
+
+    def clear_safe_stop(self) -> None:
+        event = getattr(self, "_safe_stop_requested", None)
+        if event is not None:
+            event.clear()
+
+    def safe_stop_requested(self) -> bool:
+        event = getattr(self, "_safe_stop_requested", None)
+        return bool(event is not None and event.is_set())
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.

@@ -564,6 +564,94 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_trusted_cxba_server_injects_native_meta_not_model_arguments(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+        from tools.mcp_tool import (
+            _cxba_trusted_context_servers,
+            _make_tool_handler,
+            _servers,
+        )
+        from tools.run_sandbox import RunMount, TrustedRunContext, bind_run_sandbox
+        from tui_gateway.cxba_runtime import (
+            attach_run,
+            reset_for_tests,
+            update_stored_session_mapping,
+        )
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("accepted", is_error=False)
+        )
+        server = _make_mock_server("cxba", session=mock_session)
+        _servers["cxba"] = server
+        _cxba_trusted_context_servers.add("cxba")
+        context = TrustedRunContext(
+            case_id="case-1",
+            business_session_id="session-1",
+            business_branch_id="branch-1",
+            run_id="run-1",
+            actor_user_id="user-1",
+            mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        )
+        attach_run(
+            run_context=context,
+            stored_session_id="stored-1",
+            runtime_session_id="runtime-1",
+        )
+        update_stored_session_mapping(
+            "runtime-1",
+            old_session_id="stored-1",
+            new_session_id="stored-after-compression",
+        )
+        try:
+            handler = _make_tool_handler("cxba", "write_proposal", 120)
+            with bind_run_sandbox("run-1"), self._patch_mcp_loop():
+                result = json.loads(
+                    handler({"cxba_context": {"run_id": "model-forged"}, "value": 1})
+                )
+            assert result["result"] == "accepted"
+            mock_session.call_tool.assert_awaited_once_with(
+                "write_proposal",
+                arguments={"cxba_context": {"run_id": "model-forged"}, "value": 1},
+                meta={
+                    "cxba_context": {
+                        "stored_session_id": "stored-after-compression",
+                        "runtime_session_id": "runtime-1",
+                        "run_id": "run-1",
+                    }
+                },
+            )
+        finally:
+            _cxba_trusted_context_servers.discard("cxba")
+            _servers.pop("cxba", None)
+            reset_for_tests()
+
+    def test_trusted_cxba_server_without_active_run_fails_before_rpc(self):
+        from tools.mcp_tool import (
+            _cxba_trusted_context_servers,
+            _make_tool_handler,
+            _servers,
+        )
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("must not run", is_error=False)
+        )
+        server = _make_mock_server("cxba", session=mock_session)
+        _servers["cxba"] = server
+        _cxba_trusted_context_servers.add("cxba")
+        try:
+            handler = _make_tool_handler("cxba", "read_case", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert "requires an active run context" in result["error"]
+            mock_session.call_tool.assert_not_awaited()
+        finally:
+            _cxba_trusted_context_servers.discard("cxba")
+            _servers.pop("cxba", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers

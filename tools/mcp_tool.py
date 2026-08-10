@@ -2678,6 +2678,7 @@ class MCPServerTask:
         headers: Optional[dict] = None,
         ssl_verify: bool = True,
         client_cert=None,
+        trust_env: bool = True,
         timeout: float = 5.0,
     ) -> None:
         """Probe *url* for an MCP-shaped response before the SDK connects.
@@ -2716,6 +2717,7 @@ class MCPServerTask:
         client_kwargs: dict = {
             "verify": ssl_verify,
             "follow_redirects": True,
+            "trust_env": trust_env,
             "timeout": _httpx.Timeout(timeout),
         }
         if client_cert is not None:
@@ -2859,6 +2861,7 @@ class MCPServerTask:
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
+        trust_env = config.get("trust_env", True) is not False
         client_cert = _resolve_client_cert(self.name, config)
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
@@ -2932,6 +2935,7 @@ class MCPServerTask:
                     kwargs: dict = {
                         "follow_redirects": True,
                         "verify": _verify_for_factory,
+                        "trust_env": trust_env,
                     }
                     if timeout is not None:
                         kwargs["timeout"] = timeout
@@ -3000,6 +3004,7 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
+                "trust_env": trust_env,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
@@ -3212,6 +3217,7 @@ class MCPServerTask:
                         headers=_probe_headers,
                         ssl_verify=config.get("ssl_verify", True),
                         client_cert=_resolve_client_cert(self.name, config),
+                        trust_env=config.get("trust_env", True) is not False,
                     )
                 except NonMcpEndpointError as exc:
                     logger.warning("%s", exc)
@@ -3632,6 +3638,7 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+_cxba_trusted_context_servers: set[str] = set()
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
@@ -3800,6 +3807,10 @@ def _record_tool_trust_metadata(
 ) -> None:
     """Capture per-server trust and per-tool readOnlyHint at discovery."""
     with _lock:
+        if (config or {}).get("cxba_trusted_context") is True:
+            _cxba_trusted_context_servers.add(server_name)
+        else:
+            _cxba_trusted_context_servers.discard(server_name)
         _server_trust_levels[server_name] = _normalize_server_trust(
             (config or {}).get("trust")
         )
@@ -5211,6 +5222,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
+            call_meta = None
+            if server_name in _cxba_trusted_context_servers:
+                from tools.run_sandbox import current_run_sandbox_id
+                from tui_gateway.cxba_runtime import get_run
+
+                active_run_id = current_run_sandbox_id()
+                active_run = get_run(active_run_id or "")
+                if active_run is None:
+                    raise RuntimeError(
+                        f"trusted CXBA MCP server '{server_name}' requires an active run context"
+                    )
+                call_meta = {
+                    "cxba_context": {
+                        "stored_session_id": active_run.stored_session_id,
+                        "runtime_session_id": active_run.runtime_session_id,
+                        "run_id": active_run.run_id,
+                    }
+                }
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
@@ -5218,7 +5247,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if call_meta is None:
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args
+                        )
+                    else:
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args, meta=call_meta
+                        )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably

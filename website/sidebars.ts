@@ -196,6 +196,18 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'cxba',
+                  key: 'skills-bundled-cxba',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/cxba/cxba-cxba-case-investigation',
+                    'user-guide/skills/bundled/cxba/cxba-cxba-material-profiling',
+                    'user-guide/skills/bundled/cxba/cxba-cxba-raw-material-investigation',
+                    'user-guide/skills/bundled/cxba/cxba-cxba-safe-tabular-analysis',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'email',
                   key: 'skills-bundled-email',
                   collapsed: true,

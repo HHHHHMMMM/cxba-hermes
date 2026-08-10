@@ -191,10 +191,12 @@ def finalize_turn(
                 )
 
     # Determine if conversation completed successfully
+    safe_stopped = str(_turn_exit_reason) == "safe_stop_after_tool"
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
         and not failed
+        and not safe_stopped
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -647,6 +649,7 @@ def finalize_turn(
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
+        "safe_stopped": safe_stopped,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
@@ -727,6 +730,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not safe_stopped
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
