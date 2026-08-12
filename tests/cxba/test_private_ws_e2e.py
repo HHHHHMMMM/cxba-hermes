@@ -12,11 +12,14 @@ def _session_context():
         "case_id": "case-1",
         "business_session_id": "session-1",
         "business_branch_id": "branch-1",
-        "initial_context": {
-            "case_basic": {"case_name": "synthetic-case"},
-            "global_master_links": [],
-            "material_catalog": [],
-        },
+    }
+
+
+def _case_context():
+    return {
+        "case_basic": {"case_id": "case-1", "case_name": "synthetic-case"},
+        "global_master_links": [],
+        "material_catalog": [],
     }
 
 
@@ -69,6 +72,7 @@ def test_private_websocket_first_submit_forwards_only_validated_run_context(
             session=session,
             text=text,
             trusted_run_context=kwargs.get("trusted_run_context"),
+            trusted_case_context=kwargs.get("trusted_case_context"),
         )
         submitted.set()
         return True
@@ -114,6 +118,7 @@ def test_private_websocket_first_submit_forwards_only_validated_run_context(
                         "session_id": create_response["result"]["session_id"],
                         "text": "inspect the synthetic material",
                         "run_context": run_context,
+                        "case_context": _case_context(),
                     },
                 })
             await asyncio.to_thread(submitted.wait, 5)
@@ -140,6 +145,7 @@ def test_private_websocket_first_submit_forwards_only_validated_run_context(
         assert trusted.business_branch_id == "branch-1"
         assert trusted.run_id == "run-1"
         assert trusted.actor_user_id == "user-1"
+        assert captured["trusted_case_context"] == _case_context()
         assert {mount.target for mount in trusted.mounts} == {
             "/data",
             "/workspace",

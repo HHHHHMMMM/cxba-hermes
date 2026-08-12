@@ -1,71 +1,36 @@
 ---
 name: cxba-raw-material-investigation
-description: Test case hypotheses against sources and counter-evidence.
-author: CXBA Project Team, Hermes Agent
-license: MIT
-metadata:
-  hermes:
-    tags: [cxba, evidence, verification]
-    related_skills: [cxba-case-investigation, cxba-material-profiling, cxba-safe-tabular-analysis]
+description: 调查混合、不规则、离线CXBA案件材料的证据方法。适用于表格、CSV、文档、银行流水和报销记录，指导问题拆解、多源验证、反证及是否临时入库。
 ---
 
-# CXBA Raw Material Investigation Skill
+# CXBA原始材料调查
 
-Use original materials to test a focused case question through corroboration and counter-evidence. The method supports selective reading and autonomous tool choice; it does not impose a fixed sequence, one-tool-per-turn rule, or compulsory second Agent.
+## 基本规则
 
-## When to Use
+- 原始材料根目录为只读`/data`；环境、脚本、底稿和结果只写`/workspace`。
+- 表格任务遵守`cxba-safe-tabular-analysis`，不得向外部服务发送案件材料或字段值。
+- 主调查Agent必须亲自理解原件。文件清单、自动目录、画像、OCR和样本只用于定位与辅助理解，不能代替原件。
+- 可批量读取同一工作簿全部Sheet，可并行处理互不依赖的材料或复算，可后台运行长时间盘点、转换和计算；任务结束后检查退出状态和产物。
+- 可按任务使用pandas、openpyxl、DuckDB、命令行工具、`execute_code`或可复跑脚本。
 
-- A claim must be traced to original documents, tables, images, or archived files.
-- Multiple sources may support or contradict the same hypothesis.
-- A calculated pattern needs source-row verification and alternative explanations.
+## 调查流程
 
-## Prerequisites
+1. **拆解问题**：明确对象、行为、期间、角色、金额或频次口径、支持证据、可能反证和待补材料。主线与外围线索分开。
+2. **掌握真实结构**：确认文件、真实格式、Sheet、标题区、表头、合并单元格、公式、数据范围及文档正文。可一次批量扫描同一工作簿全部Sheet，再对关键区域深读。
+3. **记录阅读范围**：在`/workspace/material-notes`记录已读文件、Sheet、页码或行段及限制。`contentPreview`只能用于预览；只有实际覆盖完整正文才能写“全文”。
+4. **确定字段角色**：区分申请人、收款人、付款人、经办人、审批人、账户户名和交易对手。先从原件确认角色字段，再计算或关联。
+5. **全量计算**：探索可使用任意合适工具；正式金额、笔数、排名、匹配和时间范围必须由`/workspace/scripts`中的可复跑脚本读取全部相关记录，结果写入`/workspace/results`。记录筛选、方向、状态、币种、空值、去重和统计对象。
+6. **多源验证**：关键事实同时检查明细、汇总和独立来源。跨表匹配写明关联键、方向、日期与金额容差及重复处理。只有来源能证明同一业务记录时才去重；汇总版不自动视为独立来源。
+7. **反证检查**：主动查找正常解释、反向流水、退款冲正、内部划转、时间不一致、材料缺失、口径差异和零命中的其他原因。
+8. **回查原件**：报告数字和候选保留原始文件、Sheet、行号或页码。形成结论前回查关键命中、最大最小值、金额方向和跨表桥接记录。
+9. **形成证据**：按`references/evidence-ledger.md`写入`/workspace/evidence-items`，最终报告遵守`references/report-contract.md`。底稿和结构化结果是分析产物，不替代原件。
 
-- Load the Spring material catalog and resolve sources by `materialId`.
-- Keep `/data` read-only and write all notes, scripts, conversions, and results to `/workspace`.
-- Use only preinstalled Sandbox capabilities; never send case content to external services.
+跨文件关联复杂、明细量大或需要重复查询、图路径分析时，可在`/workspace`使用DuckDB等临时分析库；简单问题直接解析。
 
-## How to Run
+## 证据边界
 
-Use `skill_view` for material profiling or safe table analysis only when the current source requires it. Use native Hermes tools directly and combine them as needed within the same Run.
-
-## Quick Reference
-
-| Record | Required content |
-|---|---|
-| Source fact | `materialId`, path, location, observed value |
-| Calculation | script, input location, filters, exact arithmetic, output |
-| Interpretation | reasoning linking facts to the case question |
-| Counter-evidence | normal explanation, conflicting source, missing scope |
-| Gap | material or verification needed to decide |
-
-## Procedure
-
-1. Express the question as a testable hypothesis and at least one plausible alternative explanation.
-2. Select the smallest relevant source set. Expand it when a discovered link or unresolved contradiction requires more material.
-3. Confirm source structure and role fields before calculation. Distinguish account owner, user, controller, operator, payer, payee, applicant, approver, and counterparty.
-4. Read cited source locations. For long files, record the exact ranges inspected and the uninspected remainder.
-5. Use reproducible scripts for aggregation, matching, and ranking. Stream large tables, keep money as decimal strings, and write large results to `/workspace/results`.
-6. Reopen representative matched rows, all decisive exceptions, and boundary values in the source.
-7. Seek disconfirming evidence: reversal, refund, internal transfer, duplicate source, date mismatch, role mismatch, missing coverage, or an independent normal explanation.
-8. Save an evidence item only after the source location and calculation can be reproduced.
-9. State whether the result supports, weakens, excludes, or cannot decide the hypothesis. Human confirmation remains required for formal findings and leads.
-
-## Optional Independent Review
-
-Use `delegate_task` only when the user requests independent review or the task's risk and complexity justify it. Give the reviewer the case question, draft claim, source `materialId` values, locations, scripts, and result paths. The reviewer must reopen the sources and rerun decisive calculations. A review of the draft alone is not independent.
-
-## Pitfalls
-
-- High value, concentration, frequency, same surname, same organization, or a model match is an observation, not a conclusion.
-- A counterparty in a transaction does not establish `OWNS`, `USES`, `CONTROLS`, or `OPERATES`.
-- Only byte-identical duplicates may be treated as duplicate files; do not merge content by names or headers.
-- A failed parser or incomplete catalog does not prove absence.
-- Do not write formal findings, leads, or PostgreSQL records directly.
-
-## Verification
-
-- Each claim has a resolvable `materialId` and precise source location.
-- Each calculation is reproducible and uses explicit roles, direction, filters, and deduplication rules.
-- Counter-evidence and coverage limits are stated next to the conclusion they qualify.
-- Optional review, if performed, records what sources and calculations were independently checked.
+- 同单位、同部门、亲属身份或同一机构任职本身只属于背景事实。列为待核实关联时，必须给出人员交集、资金往来、审批链、报销对象或时间重叠等桥接证据，并写明证据缺口。
+- 高额、集中、同名、同事关系或算法命中只能形成候选，不得直接写成违规事实。
+- 零命中必须区分“确实不存在”“字段或角色选择错误”“材料未覆盖”和“格式未识别”。
+- 抽样只用于结构理解，不得把抽样结果描述成全量结论。
+- 对话只读取完成任务所需的字段、计数、有限聚合、候选和定位；大结果落盘后按字段或范围读取，截断内容不得作为证据。

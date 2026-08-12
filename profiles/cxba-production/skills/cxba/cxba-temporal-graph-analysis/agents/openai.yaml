@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA Temporal Graph Analysis"
+  short_description: "Find time patterns and candidate transaction chains"
+  default_prompt: "Use $cxba-temporal-graph-analysis to normalize the selected material, search temporal graph patterns, and verify candidate chains against original rows."

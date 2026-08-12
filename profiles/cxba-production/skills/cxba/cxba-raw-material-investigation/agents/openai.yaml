@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA原始材料调查"
+  short_description: "只读盘点、交叉核验并形成可复核的案件材料初步调查报告"
+  default_prompt: "使用$cxba-raw-material-investigation对指定案件材料目录进行只读、证据导向的初步调查。"

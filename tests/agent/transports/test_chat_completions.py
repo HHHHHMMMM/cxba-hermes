@@ -19,6 +19,35 @@ def transport():
 
 class TestChatCompletionsBasic:
 
+    @pytest.mark.parametrize(
+        ("reasoning_config", "expected"),
+        [
+            ({"enabled": True, "effort": "medium"}, True),
+            ({"enabled": False, "effort": "none"}, False),
+        ],
+    )
+    def test_configured_local_chat_template_thinking_follows_session_toggle(
+        self, transport, reasoning_config, expected
+    ):
+        configured = {
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": True},
+                "caller_only": "kept",
+            }
+        }
+
+        kwargs = transport.build_kwargs(
+            model="qwen3.6-35b-a3b",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config=reasoning_config,
+            request_overrides=configured,
+        )
+
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is expected
+        assert kwargs["extra_body"]["caller_only"] == "kept"
+        assert configured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+
 
 
     @pytest.mark.parametrize("provider", ["nous", "openrouter"])

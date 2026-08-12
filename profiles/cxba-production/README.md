@@ -15,6 +15,7 @@ contains references only and never stores their values:
 ```text
 CXBA_LOCAL_MODEL=<local OpenAI-compatible model name>
 CXBA_LOCAL_MODEL_BASE_URL=<local OpenAI-compatible endpoint>
+CXBA_BAILIAN_API_KEY=<Bailian API key, required for the current production profile>
 CXBA_GATEWAY_PRIVATE_TOKEN=<at least 32 random characters, used only by Spring's private WebSocket>
 CXBA_CASE_STORAGE_ROOT=<absolute host path outside the Sandbox>
 CXBA_SPRING_MCP_URL=<Spring MCP endpoint>

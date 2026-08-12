@@ -90,6 +90,41 @@ def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> di
     return reasoning_config
 
 
+def _reasoning_aware_request_overrides(
+    request_overrides: dict | None,
+    reasoning_config: dict | None,
+) -> dict | None:
+    """Apply a per-turn toggle to an explicitly configured chat template switch.
+
+    Local llama.cpp-compatible servers expose model-specific thinking through
+    ``chat_template_kwargs.enable_thinking`` instead of the generic OpenRouter
+    ``reasoning`` object.  The static custom-provider body opts into that wire
+    contract; this function only changes the configured boolean and never adds
+    the field to endpoints that did not declare it.
+    """
+    if not isinstance(request_overrides, dict) or not isinstance(reasoning_config, dict):
+        return request_overrides
+    extra_body = request_overrides.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return request_overrides
+    template_kwargs = extra_body.get("chat_template_kwargs")
+    if not isinstance(template_kwargs, dict) or not isinstance(
+        template_kwargs.get("enable_thinking"), bool
+    ):
+        return request_overrides
+
+    enabled = reasoning_config.get("enabled") is not False
+    if str(reasoning_config.get("effort") or "").strip().lower() == "none":
+        enabled = False
+    updated = dict(request_overrides)
+    updated_body = dict(extra_body)
+    updated_template = dict(template_kwargs)
+    updated_template["enable_thinking"] = enabled
+    updated_body["chat_template_kwargs"] = updated_template
+    updated["extra_body"] = updated_body
+    return updated
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
@@ -581,7 +616,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["extra_body"] = extra_body
 
         # Request overrides last (service_tier etc.)
-        overrides = params.get("request_overrides")
+        overrides = _reasoning_aware_request_overrides(
+            params.get("request_overrides"), reasoning_config
+        )
         if overrides:
             api_kwargs.update(overrides)
 

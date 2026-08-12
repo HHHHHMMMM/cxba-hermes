@@ -22,6 +22,8 @@ from typing import Any, Iterator
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _registry_lock = threading.Lock()
+_destroy_locks: dict[str, threading.Lock] = {}
+_destroyed_run_ids: set[str] = set()
 _tool_process_heartbeats: dict[str, tuple[bool, float]] = {}
 _TOOL_HEARTBEAT_STALE_SECONDS = 15.0
 _current_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -190,6 +192,7 @@ def register_run_sandbox(context: TrustedRunContext) -> None:
     volumes.append(f"{output_directory}:/run-diagnostics:ro")
     validate_registered_mount_sources(volumes)
     with _registry_lock:
+        _destroyed_run_ids.discard(context.run_id)
         with terminal_tool._env_lock:
             if context.run_id in terminal_tool._active_environments:
                 raise RuntimeError(f"run sandbox already exists: {context.run_id}")
@@ -238,11 +241,21 @@ def destroy_run_sandbox(run_id: str) -> None:
 
     from tools.environments.docker import _get_active_profile_name, remove_task_containers
 
-    cleanup_vm_and_wait(run_id, force_remove=True)
-    remove_task_containers(run_id, profile_filter=_get_active_profile_name())
-    clear_task_env_overrides(run_id)
     with _registry_lock:
-        _tool_process_heartbeats.pop(run_id, None)
+        if run_id in _destroyed_run_ids:
+            return
+        destroy_lock = _destroy_locks.setdefault(run_id, threading.Lock())
+    with destroy_lock:
+        with _registry_lock:
+            if run_id in _destroyed_run_ids:
+                return
+        cleanup_vm_and_wait(run_id, force_remove=True)
+        remove_task_containers(run_id, profile_filter=_get_active_profile_name())
+        clear_task_env_overrides(run_id)
+        with _registry_lock:
+            _destroyed_run_ids.add(run_id)
+            _destroy_locks.pop(run_id, None)
+            _tool_process_heartbeats.pop(run_id, None)
 
 
 @contextlib.contextmanager

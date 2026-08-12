@@ -2136,6 +2136,30 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
+def _environment_container_is_absent(env) -> bool:
+    container_id = str(getattr(env, "_container_id", "") or "")
+    if not container_id:
+        return True
+    docker_exe = str(getattr(env, "_docker_exe", "") or "docker")
+    try:
+        inspected = subprocess.run(
+            [docker_exe, "inspect", container_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if inspected.returncode == 0:
+        return False
+    detail = f"{inspected.stdout or ''}\n{inspected.stderr or ''}".lower()
+    return "no such object" in detail or "no such container" in detail
+
+
 def cleanup_vm_and_wait(task_id: str, *, force_remove: bool = False) -> None:
     """Synchronously tear down one explicitly managed environment.
 
@@ -2164,12 +2188,19 @@ def cleanup_vm_and_wait(task_id: str, *, force_remove: bool = False) -> None:
         if callable(wait_for_result):
             wait_for_result()
     except Exception:
-        logger.error(
-            "event=environment_cleanup stage=wait status=failed taskId=%s",
-            task_id,
-            exc_info=True,
-        )
-        raise
+        if force_remove and _environment_container_is_absent(env):
+            logger.warning(
+                "event=environment_cleanup stage=wait status=already_absent taskId=%s",
+                task_id,
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                "event=environment_cleanup stage=wait status=failed taskId=%s",
+                task_id,
+                exc_info=True,
+            )
+            raise
     with _env_lock:
         if _active_environments.get(task_id) is env:
             _active_environments.pop(task_id, None)

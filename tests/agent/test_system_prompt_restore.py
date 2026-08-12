@@ -31,6 +31,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.model = "test-model"
     agent.provider = "openrouter"
     agent.platform = "cli"
+    agent.skip_context_files = False
     agent._session_db = session_db
     # MagicMock attributes are truthy by default; the static-prefix
     # reconstruction is gated on _use_prompt_caching, so default it off
@@ -112,6 +113,26 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_context_free_agent_rebuilds_prompt_that_contains_project_files(self):
+        stored = (
+            "You are Hermes Agent.\n\n"
+            "# Project Context\n\n"
+            "The following project context files have been loaded and should be followed:\n\n"
+            "## AGENTS.md\n\nrepository contributor instructions"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="CXBA prompt without cwd files")
+        agent.skip_context_files = True
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == "CXBA prompt without cwd files"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "CXBA prompt without cwd files"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -77,9 +77,13 @@ def test_production_profile_disables_runtime_network_and_context_files() -> None
 
 def test_local_model_must_be_deployment_configured() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
-    assert config["model"]["provider"] == "custom"
+    assert config["model"]["provider"] == "custom:cxba-bailian"
     assert config["model"]["default"] == "${env:CXBA_LOCAL_MODEL}"
     assert config["model"]["base_url"] == "${env:CXBA_LOCAL_MODEL_BASE_URL}"
+    [provider] = config["custom_providers"]
+    assert provider["name"] == "cxba-bailian"
+    assert provider["key_env"] == "CXBA_BAILIAN_API_KEY"
+    assert provider["extra_body"] == {"enable_thinking": False}
 
 
 def test_private_gateway_storage_and_spring_mcp_are_environment_bound() -> None:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA Interactive Data Analysis"
+  short_description: "Clarify scope, then analyze selected case data"
+  default_prompt: "Use $cxba-interactive-data-analysis to clarify material ambiguities and answer my focused case-data question with reproducible calculations."

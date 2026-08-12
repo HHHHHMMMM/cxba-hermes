@@ -5360,14 +5360,13 @@ def _tool_ctx(name: str, args: dict) -> str:
 
 def _tool_material_reference(sid: str, args: dict) -> dict[str, str] | None:
     """Resolve exactly one `/data` path against the trusted Spring catalog."""
-    session = _sessions.get(sid)
-    binding = session.get("cxba_binding") if isinstance(session, dict) else None
-    initial_context = (
-        binding.get("initial_context") if isinstance(binding, dict) else None
-    )
+    from tui_gateway.cxba_runtime import run_for_session
+
+    run = run_for_session(sid)
+    case_context = run.case_context if run is not None else None
     catalog = (
-        initial_context.get("material_catalog")
-        if isinstance(initial_context, dict)
+        case_context.get("material_catalog")
+        if isinstance(case_context, dict)
         else None
     )
     if not isinstance(catalog, list):
@@ -5387,6 +5386,8 @@ def _tool_material_reference(sid: str, args: dict) -> dict[str, str] | None:
     matches: list[dict[str, str]] = []
     for item in catalog:
         if not isinstance(item, dict):
+            continue
+        if item.get("recycled") is True:
             continue
         material_id = str(
             item.get("material_id") or item.get("materialId") or ""
@@ -7005,7 +7006,15 @@ def _make_agent(
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
-        skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
+        # A trusted CXBA session investigates a case, not the Hermes source
+        # checkout that happens to host the Gateway process.  Keep the CXBA
+        # SOUL identity and control-plane context, but never inject cwd files
+        # such as the repository's contributor AGENTS.md into a case Run.
+        skip_context_files=(
+            cxba_binding is not None
+            or is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
+        ),
+        load_soul_identity=cxba_binding is not None,
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
@@ -7873,6 +7882,7 @@ def _enqueue_prompt(
     transport: Any,
     image_paths: list[str] | None = None,
     trusted_run_context: Any = None,
+    trusted_case_context: dict[str, Any] | None = None,
     consumes_cxba_approvals: bool = False,
 ) -> bool:
     """Stash a message to run as the very next turn once the live one ends.
@@ -7888,6 +7898,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if trusted_run_context is not None:
         queued["trusted_run_context"] = trusted_run_context
+    if trusted_case_context is not None:
+        queued["trusted_case_context"] = trusted_case_context
     if consumes_cxba_approvals:
         queued["consumes_cxba_approvals"] = True
     if image_paths:
@@ -7900,6 +7912,7 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and existing.get("trusted_run_context") is trusted_run_context
+        and existing.get("trusted_case_context") == trusted_case_context
         and bool(existing.get("consumes_cxba_approvals"))
         == bool(consumes_cxba_approvals)
         and not session.get("queued_prompts")
@@ -7951,6 +7964,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 def _handle_busy_submit(
     rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
     trusted_run_context: Any = None,
+    trusted_case_context: dict[str, Any] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -8029,6 +8043,7 @@ def _handle_busy_submit(
             transport,
             image_paths=image_paths,
             trusted_run_context=trusted_run_context,
+            trusted_case_context=trusted_case_context,
         )
         session["last_active"] = time.time()
 
@@ -8096,6 +8111,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
                     trusted_run_context=queued.get("trusted_run_context"),
+                    trusted_case_context=queued.get("trusted_case_context"),
                     consumes_cxba_approvals=bool(
                         queued.get("consumes_cxba_approvals")
                     ),
@@ -8108,6 +8124,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     queued_prompt_generation=queue_generation,
                     trusted_run_context=queued.get("trusted_run_context"),
+                    trusted_case_context=queued.get("trusted_case_context"),
                     consumes_cxba_approvals=bool(
                         queued.get("consumes_cxba_approvals")
                     ),
@@ -9994,16 +10011,19 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     trusted_run_context=None,
+    trusted_case_context: dict[str, Any] | None = None,
     consumes_cxba_approvals: bool = False,
 ) -> bool:
-    if trusted_run_context is None:
-        active_run_id = str(session.get("active_cxba_run_id") or "")
-        if active_run_id:
-            from tui_gateway.cxba_runtime import get_run
+    active_run_id = str(session.get("active_cxba_run_id") or "")
+    if active_run_id:
+        from tui_gateway.cxba_runtime import get_run
 
-            active_run = get_run(active_run_id)
-            if active_run is not None and active_run.runtime_session_id == sid:
+        active_run = get_run(active_run_id)
+        if active_run is not None and active_run.runtime_session_id == sid:
+            if trusted_run_context is None:
                 trusted_run_context = active_run.context
+            if trusted_case_context is None:
+                trusted_case_context = active_run.case_context
     cxba_run = None
     if trusted_run_context is not None:
         try:
@@ -10013,6 +10033,7 @@ def _run_prompt_submit(
                 run_context=trusted_run_context,
                 stored_session_id=str(session.get("session_key") or ""),
                 runtime_session_id=sid,
+                case_context=trusted_case_context,
             )
             session["active_cxba_run_id"] = trusted_run_context.run_id
             _emit(
@@ -10040,6 +10061,19 @@ def _run_prompt_submit(
                 "error",
                 sid,
                 {"message": f"failed to register trusted Run sandbox: {exc}"},
+            )
+            return False
+        try:
+            from tui_gateway.cxba_claims import prepare_claim_delivery
+
+            prepare_claim_delivery(cxba_run)
+        except Exception as exc:
+            with session["history_lock"]:
+                session["running"] = False
+            _emit(
+                "error",
+                sid,
+                {"message": f"failed to prepare CXBA claim delivery: {exc}"},
             )
             return False
     with session["history_lock"]:
@@ -10309,6 +10343,21 @@ def _run_prompt_submit(
                 elif isinstance(run_message, list):
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
+            # Current case data belongs only to this new model input. Keeping it
+            # out of the persisted user message and stable system prompt preserves
+            # both a clean transcript and provider prefix caching.
+            if cxba_run is not None:
+                from tui_gateway.cxba_runtime import case_context_model_prompt
+
+                if current_case_note := case_context_model_prompt(cxba_run.case_context):
+                    if isinstance(run_message, str):
+                        run_message = f"{current_case_note}\n\n{run_message}"
+                    elif isinstance(run_message, list):
+                        run_message = [
+                            {"type": "text", "text": current_case_note},
+                            *run_message,
+                        ]
+
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
@@ -10563,6 +10612,15 @@ def _run_prompt_submit(
                         if persisted.get("role") == "user" and persisted.get("_row_id"):
                             payload["user_message_row_id"] = persisted["_row_id"]
                             break
+                if cxba_run is not None:
+                    from tui_gateway.cxba_claims import read_claim_delivery
+
+                    payload.update(
+                        read_claim_delivery(
+                            cxba_run,
+                            str(raw or ""),
+                        )
+                    )
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

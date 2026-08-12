@@ -9,6 +9,7 @@ from tui_gateway.cxba_runtime import (
     add_event,
     attach_run,
     binding_system_context,
+    case_context_model_prompt,
     discard_queued_approval_result,
     drain_approval_events,
     fetch_events,
@@ -20,6 +21,7 @@ from tui_gateway.cxba_runtime import (
     reset_for_tests,
     runtime_owns_sandbox,
     validate_run_matches_binding,
+    validate_case_context,
     validate_session_binding,
 )
 
@@ -34,11 +36,18 @@ def _binding(branch_id: str = "branch-1") -> dict:
         "case_id": "case-1",
         "business_session_id": "session-1",
         "business_branch_id": branch_id,
-        "initial_context": {
-            "case_basic": {"name": "测试案件"},
-            "global_master_links": [{"type": "ACCOUNT", "id": "account-1"}],
-            "material_catalog": [{"material_id": "material-1", "name": "流水.xlsx"}],
-        },
+    }
+
+
+def _case_context(material_catalog=None) -> dict:
+    return {
+        "case_basic": {"case_id": "case-1", "name": "测试案件"},
+        "global_master_links": [{"type": "ACCOUNT", "id": "account-1"}],
+        "material_catalog": list(
+            material_catalog
+            if material_catalog is not None
+            else [{"material_id": "material-1", "name": "流水.xlsx"}]
+        ),
     }
 
 
@@ -55,31 +64,33 @@ def _run(tmp_path: Path, run_id: str = "run-1") -> TrustedRunContext:
     )
 
 
-def test_trusted_binding_has_only_minimum_initial_context() -> None:
+def test_session_binding_is_stable_and_run_context_is_dynamic() -> None:
     binding = validate_session_binding(_binding())
-    context = binding_system_context(binding)
+    system_context = binding_system_context(binding)
+    run_context = validate_case_context(_case_context())
+    run_prompt = case_context_model_prompt(run_context)
 
-    assert "测试案件" in context
-    assert "material-1" in context
-    injected = json.loads(context.rsplit("\n", 1)[-1])
+    assert "测试案件" not in system_context
+    assert "material-1" not in system_context
+    injected = json.loads(system_context.rsplit("\n", 1)[-1])
     assert set(injected) == {
         "case_id",
         "business_session_id",
         "business_branch_id",
-        "case_basic",
-        "global_master_links",
-        "material_catalog",
     }
-    with pytest.raises(ValueError, match="initial_context"):
-        validate_session_binding(
-            {
-                **_binding(),
-                "initial_context": {
-                    **_binding()["initial_context"],
-                    "confirmed_findings": [],
-                },
-            }
-        )
+    assert "测试案件" in run_prompt
+    assert '"count":1' in run_prompt
+    assert "material-1" not in run_prompt
+
+
+def test_session_binding_rejects_unexpected_business_fields() -> None:
+    with pytest.raises(ValueError, match="cxba_context"):
+        validate_session_binding({**_binding(), "case_basic": {}})
+
+
+def test_run_context_rejects_extra_business_sections() -> None:
+    with pytest.raises(ValueError, match="case_context"):
+        validate_case_context({**_case_context(), "confirmed_findings": []})
 
 
 def test_run_must_match_case_session_and_branch_binding(tmp_path: Path) -> None:
@@ -498,19 +509,11 @@ def test_material_event_journal_failure_is_not_swallowed(
         run_context=run,
         stored_session_id="stored-1",
         runtime_session_id="runtime-1",
+        case_context=_case_context(
+            [{"materialId": "material-1", "relativePath": "material.csv"}]
+        ),
     )
-    server._sessions["runtime-1"] = {
-        "cxba_binding": {
-            "initial_context": {
-                "material_catalog": [
-                    {
-                        "materialId": "material-1",
-                        "relativePath": "material.csv",
-                    }
-                ]
-            }
-        }
-    }
+    server._sessions["runtime-1"] = {"cxba_binding": _binding()}
     monkeypatch.setattr(
         server,
         "_emit",
@@ -543,17 +546,14 @@ def test_material_events_resolve_one_trusted_catalog_item_and_real_status(
         run_context=run,
         stored_session_id="stored-1",
         runtime_session_id="runtime-material",
+        case_context=_case_context(
+            [
+                {"materialId": "material-1", "relativePath": "first.csv"},
+                {"materialId": "material-2", "relativePath": "second.csv"},
+            ]
+        ),
     )
-    server._sessions["runtime-material"] = {
-        "cxba_binding": {
-            "initial_context": {
-                "material_catalog": [
-                    {"materialId": "material-1", "relativePath": "first.csv"},
-                    {"materialId": "material-2", "relativePath": "second.csv"},
-                ]
-            }
-        }
-    }
+    server._sessions["runtime-material"] = {"cxba_binding": _binding()}
     emitted = []
     monkeypatch.setattr(
         server,
@@ -623,17 +623,14 @@ def test_material_events_do_not_guess_unknown_or_ambiguous_paths(
         run_context=run,
         stored_session_id="stored-1",
         runtime_session_id="runtime-material-none",
+        case_context=_case_context(
+            [
+                {"materialId": "material-1", "relativePath": "first.csv"},
+                {"materialId": "material-2", "relativePath": "second.csv"},
+            ]
+        ),
     )
-    server._sessions["runtime-material-none"] = {
-        "cxba_binding": {
-            "initial_context": {
-                "material_catalog": [
-                    {"materialId": "material-1", "relativePath": "first.csv"},
-                    {"materialId": "material-2", "relativePath": "second.csv"},
-                ]
-            }
-        }
-    }
+    server._sessions["runtime-material-none"] = {"cxba_binding": _binding()}
     emitted = []
     monkeypatch.setattr(
         server,

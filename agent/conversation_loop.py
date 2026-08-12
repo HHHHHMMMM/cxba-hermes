@@ -673,6 +673,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
+    if (
+        bool(getattr(agent, "skip_context_files", False))
+        and "The following project context files have been loaded and should be followed:"
+        in prompt
+    ):
+        return False
+
     def line_value(label: str) -> str:
         """Last matching line wins.
 

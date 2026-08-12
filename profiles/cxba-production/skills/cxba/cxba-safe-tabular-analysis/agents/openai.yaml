@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA安全表格分析"
+  short_description: "安全盘点、定位、聚合与交叉核验不规则案件表格及明细数据"
+  default_prompt: "使用$cxba-safe-tabular-analysis安全盘点并聚合指定案件表格目录。"

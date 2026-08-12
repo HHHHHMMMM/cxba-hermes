@@ -1,9 +1,19 @@
 model:
-  provider: custom
+  provider: custom:cxba-bailian
   default: "${env:CXBA_LOCAL_MODEL}"
   base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
+  context_length: 262144
 
 fallback_providers: []
+
+custom_providers:
+  - name: cxba-bailian
+    base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
+    model: "${env:CXBA_LOCAL_MODEL}"
+    key_env: CXBA_BAILIAN_API_KEY
+    api_mode: chat_completions
+    extra_body:
+      enable_thinking: false
 
 memory:
   memory_enabled: false

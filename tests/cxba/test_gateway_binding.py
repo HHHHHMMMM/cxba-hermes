@@ -1,6 +1,7 @@
 import json
 import threading
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from hermes_state import SessionDB
 from agent.conversation_compression import _compression_child_model_config
@@ -13,11 +14,14 @@ def _context(*, case_id="case-1", session_id="session-1", branch_id="branch-1"):
         "case_id": case_id,
         "business_session_id": session_id,
         "business_branch_id": branch_id,
-        "initial_context": {
-            "case_basic": {"case_name": "测试案件"},
-            "global_master_links": [],
-            "material_catalog": [],
-        },
+    }
+
+
+def _case_context(*, case_id="case-1", material_catalog=None):
+    return {
+        "case_basic": {"case_id": case_id, "case_name": "测试案件"},
+        "global_master_links": [],
+        "material_catalog": list(material_catalog or []),
     }
 
 
@@ -35,6 +39,45 @@ def _live_record(binding):
         "cxba_binding": binding,
         "transport": SimpleNamespace(cxba_private_authority=True),
     }
+
+
+def test_trusted_cxba_agent_skips_repository_context_but_keeps_soul(monkeypatch):
+    sid = "trusted-cxba-context-policy"
+    server._sessions[sid] = {"cxba_binding": _context()}
+    fake_runtime = {
+        "provider": "custom",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_key": "no-key-required",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    try:
+        with (
+            patch("tui_gateway.server._load_cfg", return_value={"agent": {}}),
+            patch("tui_gateway.server._get_db", return_value=MagicMock()),
+            patch("tui_gateway.server._resolve_startup_runtime", return_value=("test-model", "custom")),
+            patch("tui_gateway.server._resolve_runtime_with_fallback") as resolve,
+            patch("tui_gateway.server._load_reasoning_config", return_value=None),
+            patch("tui_gateway.server._load_service_tier", return_value=None),
+            patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+            patch("run_agent.AIAgent") as agent_type,
+        ):
+            resolve.return_value = SimpleNamespace(
+                runtime=fake_runtime, used_fallback=False, selected_model=None
+            )
+            server._make_agent(sid, "stored-session", session_id="stored-session")
+
+        kwargs = agent_type.call_args.kwargs
+        assert kwargs["skip_context_files"] is True
+        assert kwargs["load_soul_identity"] is True
+        assert "CXBA trusted case context follows" in kwargs["ephemeral_system_prompt"]
+        assert "mounted read-only under /data" in kwargs["ephemeral_system_prompt"]
+        assert "/workspace/input/materials.json" in kwargs["ephemeral_system_prompt"]
+        assert "cxba-material-profiling" in kwargs["ephemeral_system_prompt"]
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_private_create_persists_binding_and_resume_rejects_cross_case(
@@ -163,6 +206,66 @@ def test_model_text_cannot_supply_or_override_trusted_run_context():
         server._sessions.pop(sid, None)
 
 
+def test_cxba_prompt_requires_current_case_context_and_rejects_cross_case_data(
+    tmp_path, monkeypatch
+):
+    sid = "cxba-current-case-context"
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    session = _live_record(_context())
+    server._sessions[sid] = session
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    mounts = []
+    for name, target, read_only in (
+        ("data", "/data", True),
+        ("workspace", "/workspace", False),
+        ("exchange", "/exchange/current", False),
+        ("shared", "/shared", True),
+    ):
+        source = tmp_path / name
+        source.mkdir()
+        mounts.append(
+            {"source": str(source), "target": target, "read_only": read_only}
+        )
+    run_context = {
+        "case_id": "case-1",
+        "business_session_id": "session-1",
+        "business_branch_id": "branch-1",
+        "run_id": "run-1",
+        "actor_user_id": "user-1",
+        "mounts": mounts,
+    }
+    try:
+        missing = server.handle_request(
+            {
+                "id": "prompt-missing-current-context",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": sid,
+                    "text": "继续调查",
+                    "run_context": run_context,
+                },
+            }
+        )
+        assert missing["error"]["code"] == 4039
+
+        mismatched = server.handle_request(
+            {
+                "id": "prompt-cross-case-context",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": sid,
+                    "text": "继续调查",
+                    "run_context": run_context,
+                    "case_context": _case_context(case_id="case-2"),
+                },
+            }
+        )
+        assert mismatched["error"]["code"] == 4039
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
 def test_ordinary_connection_cannot_read_or_rebind_live_cxba_session():
     sid = "cxba-private-only"
     private_transport = SimpleNamespace(cxba_private_authority=True)
@@ -236,6 +339,7 @@ def test_idle_waiting_run_steer_starts_same_run_readonly_continuation(
         run_context=context,
         stored_session_id="stored-parent",
         runtime_session_id="runtime-readonly",
+        case_context=_case_context(),
     )
     mark_waiting_approval(context.run_id)
     session = _live_record(_context())
@@ -250,6 +354,11 @@ def test_idle_waiting_run_steer_starts_same_run_readonly_continuation(
     monkeypatch.setattr(server, "_run_prompt_submit", start_same_run)
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
     token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    refreshed_case_context = _case_context(
+        material_catalog=[
+            {"materialId": "new-material", "relativePath": "补充材料.txt"}
+        ]
+    )
     try:
         response = server.handle_request(
             {
@@ -258,12 +367,14 @@ def test_idle_waiting_run_steer_starts_same_run_readonly_continuation(
                 "params": {
                     "session_id": "runtime-readonly",
                     "text": "继续核对另一份只读材料",
+                    "case_context": refreshed_case_context,
                 },
             }
         )
         assert response["result"]["status"] == "continuing"
         assert response["result"]["control_outcome"] == "accepted"
         assert captured["trusted_run_context"] is context
+        assert captured["trusted_case_context"] == refreshed_case_context
         assert captured["text"] == "继续核对另一份只读材料"
         assert session["running"] is True
     finally:

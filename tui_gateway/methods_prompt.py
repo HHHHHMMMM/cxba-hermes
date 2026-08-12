@@ -114,6 +114,7 @@ def _(rid, params: dict) -> dict:
     if session.get("_cxba_retiring"):
         return _err(rid, 4100, "CXBA business Session is retiring and cannot accept prompts")
     trusted_run_context = None
+    trusted_case_context = None
     if "run_context" in params:
         from tui_gateway.transport import has_cxba_private_authority
 
@@ -125,9 +126,24 @@ def _(rid, params: dict) -> dict:
             trusted_run_context = validate_run_context(params.get("run_context"))
         except (OSError, ValueError) as exc:
             return _err(rid, 4032, f"invalid trusted run_context: {exc}")
+    if "case_context" in params:
+        from tui_gateway.transport import has_cxba_private_authority
+
+        if not has_cxba_private_authority():
+            return _err(rid, 4031, "case_context requires a trusted CXBA private connection")
+        try:
+            from tui_gateway.cxba_runtime import validate_case_context
+
+            trusted_case_context = validate_case_context(params.get("case_context"))
+        except ValueError as exc:
+            return _err(rid, 4039, f"invalid trusted case_context: {exc}")
     cxba_binding = session.get("cxba_binding")
     if cxba_binding is not None and trusted_run_context is None:
         return _err(rid, 4037, "CXBA session prompt requires a trusted run_context")
+    if cxba_binding is not None and trusted_case_context is None:
+        return _err(rid, 4039, "CXBA session prompt requires a trusted case_context")
+    if cxba_binding is None and trusted_case_context is not None:
+        return _err(rid, 4039, "case_context requires a trusted CXBA session binding")
     if trusted_run_context is not None:
         try:
             from tui_gateway.cxba_runtime import (
@@ -143,6 +159,12 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4094, "Run is safe-stopping; only approval completion may continue")
         except ValueError as exc:
             return _err(rid, 4038, f"run_context does not match the session binding: {exc}")
+        try:
+            from tui_gateway.cxba_runtime import validate_case_context_matches_binding
+
+            validate_case_context_matches_binding(cxba_binding, trusted_case_context)
+        except ValueError as exc:
+            return _err(rid, 4039, f"case_context does not match the session binding: {exc}")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
@@ -175,6 +197,7 @@ def _(rid, params: dict) -> dict:
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
             trusted_run_context=trusted_run_context,
+            trusted_case_context=trusted_case_context,
         )
         if busy_response is not None:
             return busy_response
@@ -403,7 +426,12 @@ def _(rid, params: dict) -> dict:
             _run_prompt_submit(rid, sid, session, text)
         else:
             _run_prompt_submit(
-                rid, sid, session, text, trusted_run_context=trusted_run_context
+                rid,
+                sid,
+                session,
+                text,
+                trusted_run_context=trusted_run_context,
+                trusted_case_context=trusted_case_context,
             )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)

@@ -114,11 +114,11 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
         "case_id": case_id,
         "business_session_id": business_session_id,
         "business_branch_id": business_branch_id,
-        "initial_context": {
-            "case_basic": {"case_name": "本地Qwen控制测试"},
-            "global_master_links": [],
-            "material_catalog": [],
-        },
+    }
+    case_context = {
+        "case_basic": {"case_id": case_id, "case_name": "本地Qwen控制测试"},
+        "global_master_links": [],
+        "material_catalog": [],
     }
 
     def run_context(run_id):
@@ -222,6 +222,7 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
                         "session_id": sid,
                         "text": text,
                         "run_context": run_context(run_id),
+                        "case_context": case_context,
                     },
                 }
             )
@@ -246,6 +247,7 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
                 "params": {
                     "session_id": sid,
                     "text": "工具完成后最终只回答 STEER_OK。",
+                    "case_context": case_context,
                 },
             }
         )

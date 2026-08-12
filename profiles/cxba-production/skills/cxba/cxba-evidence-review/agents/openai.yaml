@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA 证据复核"
+  short_description: "独立逐条回查分析结论、计算结果、原始引用及候选证据链条"
+  default_prompt: "使用 $cxba-evidence-review 独立拆分并复核报告中的每条 claim，复算关键金额并给出明确 verdict。"

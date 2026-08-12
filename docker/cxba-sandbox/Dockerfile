@@ -27,7 +27,7 @@ RUN python -m pip install --no-cache-dir --requirement /opt/cxba/requirements.tx
     && python -m pip check \
     && python -m pip uninstall --yes pip
 
-COPY profiles/cxba-production/skills/cxba/cxba-material-profiling/scripts /opt/cxba/scripts
+COPY profiles/cxba-production/skills/cxba/cxba-safe-tabular-analysis/scripts /opt/cxba/scripts
 COPY docker/cxba-sandbox/smoke.py /opt/cxba/smoke.py
 
 RUN chmod 0555 /opt/cxba/scripts/*.py \

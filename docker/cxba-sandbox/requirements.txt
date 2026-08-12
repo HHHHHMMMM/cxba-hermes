@@ -12,6 +12,7 @@ PyMuPDF>=1.24,<2
 python-docx>=1.1,<2
 python-pptx>=1.0,<2
 striprtf>=0.0.28,<0.2
+extract-msg>=0.56,<1
 Pillow>=11,<13
 pytesseract>=0.3.13,<0.5
 matplotlib>=3.9,<4

@@ -3938,14 +3938,29 @@ def _(rid, params: dict) -> dict:
         return err
     sid = str(params.get("session_id") or "")
     cxba_run = None
+    model_text = text
     if _is_cxba_run_session(sid):
-        from tui_gateway.cxba_runtime import run_for_session
+        from tui_gateway.cxba_runtime import (
+            case_context_model_prompt,
+            run_for_session,
+            update_run_case_context,
+        )
 
         cxba_run = run_for_session(sid)
         if cxba_run is None:
             return _err(rid, 4094, "CXBA Run is terminal or detached")
         if cxba_run.status == "SAFE_STOPPING":
             return _err(rid, 4094, "CXBA Run is stopping and cannot accept steer")
+        if "case_context" not in params:
+            return _err(rid, 4039, "CXBA Run control requires a trusted case_context")
+        try:
+            cxba_run = update_run_case_context(
+                sid, session.get("cxba_binding"), params.get("case_context")
+            )
+        except ValueError as exc:
+            return _err(rid, 4039, f"invalid trusted case_context: {exc}")
+        if current_case_note := case_context_model_prompt(cxba_run.case_context):
+            model_text = f"{current_case_note}\n\n{text}"
         if not session.get("running"):
             with session["history_lock"]:
                 if session.get("running"):
@@ -3958,6 +3973,7 @@ def _(rid, params: dict) -> dict:
                 text,
                 display_kind="cxba_read_only_continuation",
                 trusted_run_context=cxba_run.context,
+                trusted_case_context=cxba_run.case_context,
             ):
                 with session["history_lock"]:
                     session["running"] = False
@@ -3975,7 +3991,7 @@ def _(rid, params: dict) -> dict:
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
     try:
-        accepted = agent.steer(text)
+        accepted = agent.steer(model_text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     if accepted:
@@ -4016,14 +4032,30 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     sid = str(params.get("session_id") or "")
+    cxba_run = None
+    model_text = text
     if _is_cxba_run_session(sid):
-        from tui_gateway.cxba_runtime import run_for_session
+        from tui_gateway.cxba_runtime import (
+            case_context_model_prompt,
+            run_for_session,
+            update_run_case_context,
+        )
 
         cxba_run = run_for_session(sid)
         if cxba_run is None:
             return _err(rid, 4094, "CXBA Run is terminal or detached")
         if cxba_run.status == "SAFE_STOPPING":
             return _err(rid, 4094, "CXBA Run is stopping and cannot be redirected")
+        if "case_context" not in params:
+            return _err(rid, 4039, "CXBA Run control requires a trusted case_context")
+        try:
+            cxba_run = update_run_case_context(
+                sid, session.get("cxba_binding"), params.get("case_context")
+            )
+        except ValueError as exc:
+            return _err(rid, 4039, f"invalid trusted case_context: {exc}")
+        if current_case_note := case_context_model_prompt(cxba_run.case_context):
+            model_text = f"{current_case_note}\n\n{text}"
     agent = session.get("agent")
     # Turn-build window: a fresh turn flips running=True and kicks off an async
     # agent build, so session["agent"] is briefly None. That is not an
@@ -4031,7 +4063,13 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        _enqueue_prompt(
+            session,
+            text,
+            current_transport() or _stdio_transport,
+            trusted_run_context=cxba_run.context if cxba_run is not None else None,
+            trusted_case_context=cxba_run.case_context if cxba_run is not None else None,
+        )
         session["last_active"] = time.time()
         return _ok(
             rid,
@@ -4044,7 +4082,7 @@ def _(rid, params: dict) -> dict:
     ):
         return _err(rid, 4010, "agent does not support active-turn redirect")
     try:
-        accepted = agent.redirect(text)
+        accepted = agent.redirect(model_text)
     except Exception as exc:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:

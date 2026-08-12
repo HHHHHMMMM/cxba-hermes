@@ -1,7 +1,9 @@
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import tools.run_sandbox as run_sandbox
 from tools.run_sandbox import (
     _configured_storage_root,
     bind_run_sandbox,
@@ -141,6 +143,43 @@ def test_bound_run_id_overrides_child_task_key(tmp_path):
         destroy_run_sandbox(context.run_id)
     assert current_run_sandbox_id() is None
     assert context.run_id not in terminal_tool._task_env_overrides
+
+
+def test_destroy_run_sandbox_is_idempotent(monkeypatch):
+    from tools import terminal_tool
+    from tools.environments import docker as docker_env
+
+    run_id = "run-idempotent"
+    calls = []
+
+    def cleanup(task_id, *, force_remove=False):
+        calls.append(("cleanup", task_id, force_remove))
+
+    def remove(task_id, *, profile_filter=None, docker_exe=None):
+        calls.append(("remove", task_id, profile_filter))
+        return 0
+
+    def clear(task_id):
+        calls.append(("clear", task_id))
+
+    monkeypatch.setattr(terminal_tool, "cleanup_vm_and_wait", cleanup)
+    monkeypatch.setattr(terminal_tool, "clear_task_env_overrides", clear)
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "cxba-production")
+    monkeypatch.setattr(docker_env, "remove_task_containers", remove)
+    run_sandbox._destroyed_run_ids.discard(run_id)
+    run_sandbox._destroy_locks.pop(run_id, None)
+    try:
+        destroy_run_sandbox(run_id)
+        destroy_run_sandbox(run_id)
+    finally:
+        run_sandbox._destroyed_run_ids.discard(run_id)
+        run_sandbox._destroy_locks.pop(run_id, None)
+
+    assert calls == [
+        ("cleanup", run_id, True),
+        ("remove", run_id, "cxba-production"),
+        ("clear", run_id),
+    ]
 
 
 def test_run_container_config_is_ephemeral_and_uses_only_dynamic_mounts(tmp_path):
@@ -286,6 +325,44 @@ def test_destroy_keeps_registration_when_explicit_cleanup_fails(tmp_path, monkey
         destroy_run_sandbox(context.run_id)
     assert context.run_id in terminal_tool._task_env_overrides
     terminal_tool.clear_task_env_overrides(context.run_id)
+
+
+def test_cleanup_vm_and_wait_accepts_missing_forced_container(monkeypatch):
+    from tools import terminal_tool
+
+    class MissingContainerEnv:
+        _container_id = "already-gone"
+        _docker_exe = "/usr/bin/docker"
+
+        def cleanup(self, *, force_remove=False):
+            assert force_remove is True
+
+        def wait_for_cleanup_result(self):
+            raise RuntimeError("docker rm exited with status 1")
+
+    task_id = "missing-forced-container"
+
+    def inspect_missing(cmd, **kwargs):
+        assert cmd == ["/usr/bin/docker", "inspect", "already-gone"]
+        return subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="",
+            stderr="Error response from daemon: No such object: already-gone",
+        )
+
+    monkeypatch.setattr(terminal_tool.subprocess, "run", inspect_missing)
+    with terminal_tool._env_lock:
+        terminal_tool._active_environments[task_id] = MissingContainerEnv()
+        terminal_tool._last_activity[task_id] = 1.0
+    try:
+        terminal_tool.cleanup_vm_and_wait(task_id, force_remove=True)
+        assert task_id not in terminal_tool._active_environments
+        assert task_id not in terminal_tool._last_activity
+    finally:
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments.pop(task_id, None)
+            terminal_tool._last_activity.pop(task_id, None)
 
 
 def test_tool_heartbeat_becomes_unhealthy_when_active_probe_is_stale(monkeypatch):

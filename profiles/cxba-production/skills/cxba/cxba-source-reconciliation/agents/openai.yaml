@@ -1,0 +1,4 @@
+interface:
+  display_name: "多源材料去重与对账"
+  short_description: "Reconcile overlapping sources without unsafe merging"
+  default_prompt: "Inspect the selected materials, establish source relationships, reconcile totals, and deduplicate only with defensible business keys."

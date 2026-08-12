@@ -1,88 +1,58 @@
 ---
 name: cxba-material-profiling
-description: Profile case materials without treating metadata as proof.
-author: CXBA Project Team, Hermes Agent
-license: MIT
-metadata:
-  hermes:
-    tags: [cxba, files, profiling]
-    related_skills: [cxba-case-investigation, cxba-raw-material-investigation, cxba-safe-tabular-analysis]
+description: 读取和画像CXBA本地材料。目标文件或问题明确时直接读取相关原件；材料范围不明确时先生成只含路径、格式、大小、Sheet和页数的薄清单，再检查相关文件结构、有限样本、实际覆盖范围和可回查原始定位。
 ---
 
-# CXBA Material Profiling Skill
+# CXBA 材料读取与画像
 
-Build a bounded structural view of case materials while preserving the Spring material identity. Profiling discovers formats and navigation points; it does not prove business meaning or require reading every material before focused work begins.
+主 Agent 必须亲自理解原件。清单、解析输出、自动摘要、文件名和脚本结果只用于定位或辅助处理，不能代替对原始结构、字段含义和命中位置的核对。
 
-## When to Use
+材料结构确认后立即按用户问题选择专项Skill。涉及夜间交易、时间集中、快进快出、资金汇聚、回转或多跳链路时，必须加载`cxba-temporal-graph-analysis`后再计算；材料画像本身不得设计或替代时序匹配算法。
 
-- A material format, encoding, Sheet layout, page count, or archive structure is unknown.
-- A stable catalog is needed before opening selected source locations.
-- New or moved materials require refreshed path resolution.
-- Do not use profile output alone as evidence or as a substitute for source reading.
+## 选择读取路径
 
-## Prerequisites
+- 目标文件、材料范围或问题已明确：直接读取相关原件，不先做全目录盘点。
+- 目标不明确或需要确认材料范围：先生成薄清单，再选择相关材料。
+- 同一工作簿的多个 Sheet、同类文件的结构读取和格式转换可以批量执行。
+- 可编写落盘的可复用脚本；耗时较长的读取、OCR、转换或计算可以后台运行，完成后检查真实输出和错误。
 
-- Spring exports a JSON catalog whose entries contain `materialId` and `relativePath`.
-- Catalog paths resolve below the read-only `/data` mount.
-- `/workspace` is writable.
-- All parsers are preinstalled in the Sandbox image; runtime installation is forbidden.
+## 薄清单
 
-## How to Run
+需要薄清单时，直接使用 Sandbox 镜像内已预装依赖的`python3`运行盘点脚本。Run 期间禁止创建虚拟环境、执行`pip install`或从网络下载依赖：
 
-Normalize the Spring catalog:
-
-```text
-terminal(command="python /opt/cxba/scripts/material_catalog.py --catalog /workspace/input/materials.json --data-root /data --output /workspace/catalog/materials.json")
+```bash
+python3 /root/.hermes/skills/cxba/cxba-safe-tabular-analysis/scripts/case_material_inventory.py --root /data --output /workspace/thin-inventory.json
 ```
 
-Profile one tabular material by stable identity:
+`thin-inventory.json`只记录文件路径、真实格式、大小、Excel Sheet 名和 PDF 页数。它用于防遗漏和定位，不生成材料内容、涉及主体、调查价值或分析结论。
 
-```text
-terminal(command="python /opt/cxba/scripts/tabular_profile.py --catalog /workspace/catalog/materials.json --material-id <materialId> --output /workspace/catalog/<safe-name>.table.json")
-```
+## 实际读取
 
-Extract one document by stable identity:
+对每个相关文件执行以下工作：
 
-```text
-terminal(command="python /opt/cxba/scripts/document_extract.py --catalog /workspace/catalog/materials.json --material-id <materialId> --output-dir /workspace/intermediate/documents")
-```
+1. 确认真实格式，不只依据扩展名或文件名。
+2. 查看结构和有限原始样本；表格至少覆盖前部、中部、尾部或与目标相关的区域。
+3. Excel 检查每个相关 Sheet 的标题区、真实表头、字段角色、数据范围、合并区域、公式和有限样本。不得用一个 Sheet 外推其他 Sheet。
+4. Word、RTF 和 PDF 检查正文与表格；扫描件结合 OCR 与页面核对。CSV、TXT 先确认编码、分隔符和实际字段。压缩包先查看成员列表，再读取相关成员。
+5. 只有原件字段和对应记录能够确认主体、角色、日期、金额方向或业务性质；名称相似、位置相邻和文件名描述只能作为定位线索。
 
-OCR one image or PDF when direct extraction is inadequate:
+有限样本只用于理解结构和决定下一步，不能据此声称未读范围的合计、规律或全量结论。
 
-```text
-terminal(command="python /opt/cxba/scripts/ocr_material.py --catalog /workspace/catalog/materials.json --material-id <materialId> --output-dir /workspace/intermediate/ocr")
-```
+## 长材料与大表
 
-## Quick Reference
+- 不把全文、大表或大批转换结果直接塞入上下文。
+- 使用合适工具或可复用脚本对长材料全量解析、转换、筛选或聚合，并把完整结果写入工作区文件。
+- Agent 在上下文中读取结构摘要、有限样本和与目标相关的命中结果；形成事实或结论前，回到原始文件核对命中行、页、段落或单元格。
+- 脚本必须保留输入范围、字段、筛选条件、排除规则和原始定位。解析失败或不同工具结果冲突时，保留真实错误并记录不确定性。
 
-| Script | Output |
-|---|---|
-| `material_catalog.py` | Validated `materialId` to current relative path mapping |
-| `tabular_profile.py` | Sheet/table structure, bounded samples, row counts, parse errors |
-| `document_extract.py` | Extracted text plus page/paragraph metadata |
-| `ocr_material.py` | OCR text and page-level output metadata |
+## 覆盖与定位
 
-## Procedure
+记录实际完成的覆盖范围，包括：
 
-1. Obtain the catalog from Spring; do not synthesize entries from a directory scan.
-2. Normalize it with `material_catalog.py`. Completion means every active catalog entry has a unique non-empty `materialId` and a path confined below `/data`.
-3. Select materials relevant to the current question. A complete catalog does not require a complete read.
-4. Run the format-specific profiler. Large tabular inputs must be streamed or read in bounded batches.
-5. Open the relevant source location with `read_file`, `vision_analyze`, or a format-specific script before making a factual claim.
-6. Record actual read ranges and failures in `/workspace/notes`; distinguish unread, partially read, read, and blocked.
-7. Refresh the Spring catalog after file rename, move, upload, or restore. Continue references by `materialId`, then resolve the new path.
+- 原始文件路径和真实格式。
+- 已检查的 Sheet、页码、行段、单元格区域或压缩包成员。
+- 样本选择方式，以及未读取或未成功解析的范围。
+- 看到的真实字段、结构和有限样本，不扩写未查看内容。
+- 支撑后续引用的原始位置。
 
-## Pitfalls
-
-- Extension and detected format may disagree; record both and use the parser matching actual content.
-- A sample, preview, candidate header, page count, or Sheet list is not evidence of the unobserved content.
-- Never mark a document fully read when only an extract preview or sample was inspected.
-- Never invent `F0001`-style identities. Directory order changes when files are added or moved.
-- Never install missing parsers during a Run. Return a clear capability error for image rebuild.
-
-## Verification
-
-- The normalized catalog retains Spring `materialId` values byte-for-byte.
-- Adding or moving a file changes only its path metadata; existing material references remain stable.
-- Every output stays below `/workspace` and no source file under `/data` changes.
-- Large-file tests show bounded sampling and streaming row iteration.
+只有实际覆盖全部相关页、行或 Sheet 时才能写“全文”或“全部”。自动提取完成只表示内容已落盘，不表示 Agent 已核对；主 Agent 仍需理解结构、检查目标相关结果并确认原始定位可回查。

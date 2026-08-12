@@ -1,0 +1,4 @@
+interface:
+  display_name: "费用报销规律分析"
+  short_description: "按明确统计口径发现可复核、可回查的报销费用规律候选"
+  default_prompt: "使用 $cxba-expense-pattern-analysis 先确认费用统计口径，再编写只读来源适配器，以原始文件名、Sheet和行号报告有限候选，不推断违规。"
