@@ -25,6 +25,28 @@ def _case_context(*, case_id="case-1", material_catalog=None):
     }
 
 
+def _mounts(root, case_id="case-1"):
+    mounts = []
+    for name, target, read_only in (
+        ("data", "/data", True),
+        ("workspace", "/workspace", False),
+        ("exchange", "/exchange/current", False),
+        ("shared", "/shared", True),
+    ):
+        source = root / name
+        source.mkdir()
+        mounts.append(
+            {"source": str(source), "target": target, "read_only": read_only}
+        )
+    memory = root / "cases" / case_id / "Memory.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# 案件长期记忆\n", encoding="utf-8")
+    mounts.append(
+        {"source": str(memory), "target": "/case/Memory.md", "read_only": True}
+    )
+    return mounts
+
+
 def _live_record(binding):
     ready = threading.Event()
     ready.set()
@@ -75,7 +97,21 @@ def test_trusted_cxba_agent_skips_repository_context_but_keeps_soul(monkeypatch)
         assert "CXBA trusted case context follows" in kwargs["ephemeral_system_prompt"]
         assert "mounted read-only under /data" in kwargs["ephemeral_system_prompt"]
         assert "/workspace/input/materials.json" in kwargs["ephemeral_system_prompt"]
-        assert "cxba-material-profiling" in kwargs["ephemeral_system_prompt"]
+        assert "cxba-analysis-router" in kwargs["ephemeral_system_prompt"]
+        assert "cxba-analysis-notebook" in kwargs["ephemeral_system_prompt"]
+        assert "cxba-claim-delivery" in kwargs["ephemeral_system_prompt"]
+        assert "person-person" in kwargs["ephemeral_system_prompt"]
+        assert "enterprise-enterprise" in kwargs["ephemeral_system_prompt"]
+        assert "account-account" in kwargs["ephemeral_system_prompt"]
+        assert "cxba_read_dictionaries" in kwargs["ephemeral_system_prompt"]
+        assert "cxba_propose_person_person_relations" in kwargs["ephemeral_system_prompt"]
+        assert "KINSHIP means relatives" in kwargs["ephemeral_system_prompt"]
+        assert "COLLEAGUE means colleagues" in kwargs["ephemeral_system_prompt"]
+        assert "shared WORKS_FOR relations do not replace" in kwargs["ephemeral_system_prompt"]
+        assert "Never create an enterprise master from its name alone" in kwargs["ephemeral_system_prompt"]
+        assert "UNIFIED_SOCIAL_CREDIT_CODE or REGISTRATION_NUMBER only" in kwargs["ephemeral_system_prompt"]
+        assert "never invent another" in kwargs["ephemeral_system_prompt"]
+        assert "existing approved master IDs" in kwargs["ephemeral_system_prompt"]
     finally:
         server._sessions.pop(sid, None)
 
@@ -183,6 +219,54 @@ def test_private_empty_create_survives_close_and_resumes_by_stable_id(
         db.close()
 
 
+def test_eager_resume_upgrades_existing_deferred_cxba_session(tmp_path, monkeypatch):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    runtime_sid = None
+    try:
+        created = server.handle_request(
+            {
+                "id": "create-deferred",
+                "method": "session.create",
+                "params": {"cxba_context": _context(), "source": "api_server"},
+            }
+        )
+        runtime_sid = created["result"]["session_id"]
+        stable_sid = created["result"]["stored_session_id"]
+        session = server._sessions[runtime_sid]
+        assert session["agent"] is None
+
+        def complete_build(sid, current):
+            assert sid == runtime_sid
+            current["agent"] = object()
+            current["agent_ready"].set()
+
+        monkeypatch.setattr(server, "_start_agent_build", complete_build)
+        resumed = server.handle_request(
+            {
+                "id": "resume-eager-live",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stable_sid,
+                    "eager_build": True,
+                    "suppress_auto_continue": True,
+                    "cxba_context": _context(),
+                },
+            }
+        )
+
+        assert resumed["result"]["session_id"] == runtime_sid
+        assert server._sessions[runtime_sid]["agent"] is not None
+    finally:
+        reset_transport(token)
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+        db.close()
+
+
 def test_model_text_cannot_supply_or_override_trusted_run_context():
     sid = "cxba-model-spoof"
     session = _live_record(_context())
@@ -214,18 +298,7 @@ def test_cxba_prompt_requires_current_case_context_and_rejects_cross_case_data(
     session = _live_record(_context())
     server._sessions[sid] = session
     token = bind_transport(SimpleNamespace(cxba_private_authority=True))
-    mounts = []
-    for name, target, read_only in (
-        ("data", "/data", True),
-        ("workspace", "/workspace", False),
-        ("exchange", "/exchange/current", False),
-        ("shared", "/shared", True),
-    ):
-        source = tmp_path / name
-        source.mkdir()
-        mounts.append(
-            {"source": str(source), "target": target, "read_only": read_only}
-        )
+    mounts = _mounts(tmp_path)
     run_context = {
         "case_id": "case-1",
         "business_session_id": "session-1",
@@ -470,6 +543,208 @@ def test_idle_approval_start_failure_can_be_explicitly_retried(
         reset_for_tests()
 
 
+def test_multiple_approval_results_resume_idle_run_once_after_all_are_resolved(
+    tmp_path, monkeypatch
+):
+    from tools.run_sandbox import RunMount, TrustedRunContext
+    from tui_gateway.cxba_runtime import (
+        approval_events_snapshot,
+        attach_run,
+        observe_tool_result,
+        reset_for_tests,
+    )
+
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = TrustedRunContext(
+        case_id="case-1",
+        business_session_id="session-1",
+        business_branch_id="branch-1",
+        run_id="run-multiple-approvals",
+        actor_user_id="user-1",
+        mounts=(RunMount(str(workspace), "/workspace", False),),
+    )
+    attach_run(
+        run_context=context,
+        stored_session_id="stored-parent",
+        runtime_session_id="runtime-multiple-approvals",
+    )
+    for proposal_id in ("proposal-1", "proposal-2"):
+        observe_tool_result(
+            context.run_id,
+            {"proposal_id": proposal_id, "status": "PENDING_APPROVAL"},
+        )
+    session = _live_record(_context())
+    session["active_cxba_run_id"] = context.run_id
+    server._sessions["runtime-multiple-approvals"] = session
+    submissions = []
+
+    def capture_submit(_rid, _sid, _session, text, **kwargs):
+        submissions.append({"text": text, **kwargs})
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", capture_submit)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    try:
+        first = server.handle_request(
+            {
+                "id": "approval-multiple-1",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-multiple-approvals",
+                    "run_id": context.run_id,
+                    "proposal_id": "proposal-1",
+                    "status": "EXECUTED",
+                    "pending_count": 1,
+                    "content": {"affected_rows": 1},
+                },
+            }
+        )
+
+        assert first["result"]["status"] == "queued"
+        assert first["result"]["pending_count"] == 1
+        assert submissions == []
+        assert session["running"] is False
+        assert [
+            item["proposal_id"] for item in approval_events_snapshot(context.run_id)
+        ] == ["proposal-1"]
+
+        second = server.handle_request(
+            {
+                "id": "approval-multiple-2",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-multiple-approvals",
+                    "run_id": context.run_id,
+                    "proposal_id": "proposal-2",
+                    "status": "REJECTED",
+                    "pending_count": 0,
+                    "content": {"proposalStatus": "REJECTED"},
+                },
+            }
+        )
+
+        assert second["result"]["status"] == "continuing"
+        assert len(submissions) == 1
+        assert '"proposal_id": "proposal-1"' in submissions[0]["text"]
+        assert '"proposal_id": "proposal-2"' in submissions[0]["text"]
+        assert submissions[0]["consumes_cxba_approvals"] is True
+        assert session["running"] is True
+    finally:
+        reset_transport(token)
+        server._sessions.pop("runtime-multiple-approvals", None)
+        reset_for_tests()
+
+
+def test_recovered_approval_attaches_new_run_without_replaying_old_tools(
+    tmp_path, monkeypatch
+):
+    from tui_gateway.cxba_runtime import approval_events_snapshot, get_run, reset_for_tests
+
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    mounts = _mounts(tmp_path)
+    run_context = {
+        **_context(),
+        "run_id": "run-recovered-approval",
+        "actor_user_id": "user-2",
+        "mounts": mounts,
+    }
+    session = _live_record(_context())
+    server._sessions["runtime-recovered-approval"] = session
+    captured = {}
+
+    def capture_submit(_rid, _sid, _session, text, **kwargs):
+        captured.update(text=text, **kwargs)
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", capture_submit)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    try:
+        response = server.handle_request(
+            {
+                "id": "approval-recovered",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-recovered-approval",
+                    "run_id": "run-recovered-approval",
+                    "source_run_id": "run-failed",
+                    "proposal_id": "proposal-1",
+                    "status": "REJECTED",
+                    "pending_count": 0,
+                    "content": {"proposalStatus": "REJECTED"},
+                    "run_context": run_context,
+                    "case_context": _case_context(),
+                },
+            }
+        )
+
+        assert response["result"]["status"] == "continuing"
+        run = get_run("run-recovered-approval")
+        assert run is not None
+        assert run.runtime_session_id == "runtime-recovered-approval"
+        assert run.case_context == _case_context()
+        assert captured["trusted_run_context"].run_id == "run-recovered-approval"
+        assert captured["trusted_case_context"] == _case_context()
+        assert captured["display_kind"] == "cxba_approval_result"
+        assert "without replaying prior tools" in captured["text"]
+        queued = approval_events_snapshot("run-recovered-approval")
+        assert queued[0]["source_run_id"] == "run-failed"
+    finally:
+        reset_transport(token)
+        server._sessions.pop("runtime-recovered-approval", None)
+        reset_for_tests()
+
+
+def test_recovered_approval_start_failure_detaches_new_run(tmp_path, monkeypatch):
+    from tui_gateway.cxba_runtime import get_run, reset_for_tests, run_for_session
+
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    mounts = _mounts(tmp_path)
+    run_context = {
+        "case_id": "case-1",
+        "business_session_id": "session-1",
+        "business_branch_id": "branch-1",
+        "run_id": "run-recovered-failed-start",
+        "actor_user_id": "user-2",
+        "mounts": mounts,
+    }
+    session = _live_record(_context())
+    server._sessions["runtime-recovered-failed-start"] = session
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    try:
+        response = server.handle_request(
+            {
+                "id": "approval-recovered-failed-start",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-recovered-failed-start",
+                    "run_id": "run-recovered-failed-start",
+                    "source_run_id": "run-failed",
+                    "proposal_id": "proposal-1",
+                    "status": "REJECTED",
+                    "pending_count": 0,
+                    "content": {},
+                    "run_context": run_context,
+                    "case_context": _case_context(),
+                },
+            }
+        )
+
+        assert response["error"]["code"] == 5031
+        assert get_run("run-recovered-failed-start").status == "FAILED"
+        assert run_for_session("runtime-recovered-failed-start") is None
+        assert session["running"] is False
+    finally:
+        reset_transport(token)
+        server._sessions.pop("runtime-recovered-failed-start", None)
+        reset_for_tests()
+
+
 def test_active_approval_steer_failure_can_be_explicitly_retried(
     tmp_path, monkeypatch
 ):
@@ -540,6 +815,91 @@ def test_active_approval_steer_failure_can_be_explicitly_retried(
     finally:
         reset_transport(token)
         server._sessions.pop("runtime-active-approval-retry", None)
+        reset_for_tests()
+
+
+def test_multiple_approval_results_steer_active_run_once_after_all_are_resolved(
+    tmp_path, monkeypatch
+):
+    from tools.run_sandbox import RunMount, TrustedRunContext
+    from tui_gateway.cxba_runtime import attach_run, observe_tool_result, reset_for_tests
+
+    monkeypatch.setenv("CXBA_CASE_STORAGE_ROOT", str(tmp_path))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = TrustedRunContext(
+        case_id="case-1",
+        business_session_id="session-1",
+        business_branch_id="branch-1",
+        run_id="run-active-multiple-approvals",
+        actor_user_id="user-1",
+        mounts=(RunMount(str(workspace), "/workspace", False),),
+    )
+    attach_run(
+        run_context=context,
+        stored_session_id="stored-parent",
+        runtime_session_id="runtime-active-multiple-approvals",
+    )
+    for proposal_id in ("proposal-1", "proposal-2"):
+        observe_tool_result(
+            context.run_id,
+            {"proposal_id": proposal_id, "status": "PENDING_APPROVAL"},
+        )
+
+    class CapturingAgent:
+        def __init__(self):
+            self.prompts = []
+
+        def steer(self, prompt):
+            self.prompts.append(prompt)
+            return True
+
+    session = _live_record(_context())
+    session["running"] = True
+    session["agent"] = CapturingAgent()
+    session["active_cxba_run_id"] = context.run_id
+    server._sessions["runtime-active-multiple-approvals"] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    try:
+        first = server.handle_request(
+            {
+                "id": "active-multiple-1",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-active-multiple-approvals",
+                    "run_id": context.run_id,
+                    "proposal_id": "proposal-1",
+                    "status": "EXECUTED",
+                    "pending_count": 1,
+                    "content": {"affected_rows": 1},
+                },
+            }
+        )
+        assert first["result"]["status"] == "queued"
+        assert session["agent"].prompts == []
+
+        second = server.handle_request(
+            {
+                "id": "active-multiple-2",
+                "method": "run.approval.resolve",
+                "params": {
+                    "session_id": "runtime-active-multiple-approvals",
+                    "run_id": context.run_id,
+                    "proposal_id": "proposal-2",
+                    "status": "EXECUTED",
+                    "pending_count": 0,
+                    "content": {"affected_rows": 2},
+                },
+            }
+        )
+        assert second["result"]["status"] == "queued"
+        assert len(session["agent"].prompts) == 1
+        assert '"proposal_id": "proposal-1"' in session["agent"].prompts[0]
+        assert '"proposal_id": "proposal-2"' in session["agent"].prompts[0]
+    finally:
+        reset_transport(token)
+        server._sessions.pop("runtime-active-multiple-approvals", None)
         reset_for_tests()
 
 

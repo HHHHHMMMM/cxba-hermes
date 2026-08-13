@@ -1505,6 +1505,9 @@ def test_prompt_submit_accepts_valid_run_context_from_private_transport(
     for name in ("data", "workspace", "session", "current", "shared"):
         paths[name] = tmp_path / name
         paths[name].mkdir()
+    paths["memory"] = tmp_path / "cases" / "case-1" / "Memory.md"
+    paths["memory"].parent.mkdir(parents=True)
+    paths["memory"].write_text("# 案件长期记忆\n", encoding="utf-8")
     run_context = {
         "case_id": "case-1",
         "business_session_id": "session-1",
@@ -1517,6 +1520,7 @@ def test_prompt_submit_accepts_valid_run_context_from_private_transport(
             {"source": str(paths["session"]), "target": "/case-sessions/session-1", "read_only": True},
             {"source": str(paths["current"]), "target": "/exchange/current", "read_only": False},
             {"source": str(paths["shared"]), "target": "/shared", "read_only": True},
+            {"source": str(paths["memory"]), "target": "/case/Memory.md", "read_only": True},
         ],
     }
     captured = {}
@@ -1542,14 +1546,27 @@ def test_prompt_submit_accepts_valid_run_context_from_private_transport(
             return False
 
     monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
-    authority = types.SimpleNamespace(cxba_private_authority=True)
+    authority = types.SimpleNamespace(
+        cxba_private_authority=True,
+        write=lambda _payload: True,
+    )
     token = bind_transport(authority)
     try:
         response = server.handle_request({
             "id": "run-trusted",
             "method": "prompt.submit",
-            "params": {"session_id": sid, "text": "work", "run_context": run_context},
+            "params": {
+                "session_id": sid,
+                "text": "work",
+                "run_context": run_context,
+                "case_context": {
+                    "case_basic": {"case_id": "case-1"},
+                    "global_master_links": [],
+                    "material_catalog": [],
+                },
+            },
         })
+        assert "result" in response, response
         assert response["result"]["status"] == "streaming"
         assert captured["trusted_run_context"].run_id == "run-1"
     finally:
@@ -4999,6 +5016,15 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
 
+def _cxba_memory_mount(tmp_path: Path, case_id: str):
+    from tools.run_sandbox import RunMount
+
+    memory = tmp_path / "cases" / case_id / "Memory.md"
+    memory.parent.mkdir(parents=True, exist_ok=True)
+    memory.write_text("# 案件长期记忆\n", encoding="utf-8")
+    return RunMount(str(memory), "/case/Memory.md", True)
+
+
 def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
     monkeypatch, tmp_path
 ):
@@ -5076,7 +5102,10 @@ def test_run_prompt_submit_uses_run_task_key_and_destroys_sandbox(
         business_branch_id="branch-1",
         run_id="run-finally-1",
         actor_user_id="user-1",
-        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-1"),
+        ),
     )
     session = _session(
         session_key="session-owner",
@@ -5145,7 +5174,10 @@ def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
         business_branch_id="branch-safe-stop",
         run_id="run-safe-stop-approval",
         actor_user_id="user-safe-stop",
-        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-safe-stop"),
+        ),
     )
     record, _created = cxba_runtime.attach_run(
         run_context=context,
@@ -5188,7 +5220,10 @@ def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
 
         assert started is True
         assert safe_stop_calls == [True]
-        assert turns == ["Trusted approval result"]
+        assert len(turns) == 1
+        assert "read /case/Memory.md completely" in turns[0]
+        assert "Trusted approval result" in turns[0]
+        assert turns[0].endswith("wait for human approval.")
         assert record.status == "SAFE_STOPPED"
         assert "active_cxba_run_id" not in session
         assert context.run_id not in terminal_tool._task_env_overrides
@@ -5236,7 +5271,10 @@ def test_run_prompt_submit_marks_returned_error_run_failed(monkeypatch, tmp_path
         business_branch_id="branch-error",
         run_id="run-returned-error",
         actor_user_id="user-error",
-        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-error"),
+        ),
     )
     turns = []
     session = _session(
@@ -5255,7 +5293,10 @@ def test_run_prompt_submit_marks_returned_error_run_failed(monkeypatch, tmp_path
         )
 
         assert started is True
-        assert turns == ["trigger provider failure"]
+        assert len(turns) == 1
+        assert "read /case/Memory.md completely" in turns[0]
+        assert "trigger provider failure" in turns[0]
+        assert turns[0].endswith("wait for human approval.")
         assert cxba_runtime.get_run(context.run_id).status == "FAILED"
         assert context.run_id not in terminal_tool._task_env_overrides
         assert any(kind == "run.failed" for kind, _sid, _payload in emitted)
@@ -5299,7 +5340,10 @@ def test_run_prompt_submit_keeps_background_only_run_sandbox(monkeypatch, tmp_pa
         business_branch_id="branch-background",
         run_id="run-background-only",
         actor_user_id="user-background",
-        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-background"),
+        ),
     )
     turns = []
     session = _session(
@@ -5318,7 +5362,10 @@ def test_run_prompt_submit_keeps_background_only_run_sandbox(monkeypatch, tmp_pa
         )
 
         assert started is True
-        assert turns == ["delegate work"]
+        assert len(turns) == 1
+        assert "read /case/Memory.md completely" in turns[0]
+        assert "delegate work" in turns[0]
+        assert turns[0].endswith("wait for human approval.")
         assert cxba_runtime.get_run(context.run_id).status == "RUNNING"
         assert context.run_id in terminal_tool._task_env_overrides
         assert any(kind == "run.background" for kind, _sid, _payload in emitted)
@@ -5473,7 +5520,10 @@ def test_run_prompt_submit_keeps_undelivered_approval_result_running(
         business_branch_id="branch-approval-delivery",
         run_id="run-approval-delivery",
         actor_user_id="user-approval-delivery",
-        mounts=(RunMount(str(tmp_path), "/workspace", False),),
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-approval-delivery"),
+        ),
     )
     record, _created = cxba_runtime.attach_run(
         run_context=context,
@@ -5511,7 +5561,10 @@ def test_run_prompt_submit_keeps_undelivered_approval_result_running(
         )
 
         assert started is True
-        assert turns == ["ordinary queued message"]
+        assert len(turns) == 1
+        assert "read /case/Memory.md completely" in turns[0]
+        assert "ordinary queued message" in turns[0]
+        assert turns[0].endswith("wait for human approval.")
         assert record.status == "RUNNING"
         assert cxba_runtime.has_undelivered_approval_results(context.run_id) is True
         assert context.run_id in terminal_tool._task_env_overrides
@@ -5541,6 +5594,110 @@ class _RecordingAgent:
     def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
+
+
+def test_run_prompt_submit_does_not_mark_case_memory_loaded_when_read_is_skipped(
+    monkeypatch, tmp_path
+):
+    from tools.run_sandbox import TrustedRunContext
+    from tui_gateway import cxba_runtime
+
+    class _SkippingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "acknowledged",
+                "messages": [
+                    {"role": "user", "content": "acknowledge"},
+                    {"role": "assistant", "content": "acknowledged"},
+                ],
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    context = TrustedRunContext(
+        case_id="case-skipped-memory-read",
+        business_session_id="business-session-skipped-memory-read",
+        business_branch_id="branch-skipped-memory-read",
+        run_id="run-skipped-memory-read",
+        actor_user_id="user-skipped-memory-read",
+        mounts=(_cxba_memory_mount(tmp_path, "case-skipped-memory-read"),),
+    )
+    turns = []
+    session = _session(
+        session_key="stored-skipped-memory-read",
+        agent=_SkippingAgent(turns),
+        running=True,
+    )
+    server._sessions["sid-skipped-memory-read"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid-skipped-memory-read",
+            "sid-skipped-memory-read",
+            session,
+            "acknowledge",
+            trusted_run_context=context,
+        ) is True
+
+        assert "acknowledgement-only" in turns[0]
+        assert "_cxba_case_memory_loaded_marker" not in session
+    finally:
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-skipped-memory-read", None)
+
+
+def test_run_prompt_submit_forgets_case_memory_marker_after_in_place_compression(
+    monkeypatch, tmp_path
+):
+    from tools.run_sandbox import TrustedRunContext
+    from tui_gateway import cxba_runtime
+    from tui_gateway.cxba_runtime import case_memory_marker
+
+    class _InPlaceCompressingAgent(_RecordingAgent):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.context_compressor = types.SimpleNamespace(compression_count=0)
+
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            self.context_compressor.compression_count += 1
+            return {"final_response": "compressed", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    context = TrustedRunContext(
+        case_id="case-in-place-compression",
+        business_session_id="business-session-in-place-compression",
+        business_branch_id="branch-in-place-compression",
+        run_id="run-in-place-compression",
+        actor_user_id="user-in-place-compression",
+        mounts=(
+            _cxba_memory_mount(tmp_path, "case-in-place-compression"),
+        ),
+    )
+    turns = []
+    session = _session(
+        session_key="stored-in-place-compression",
+        agent=_InPlaceCompressingAgent(turns),
+        running=True,
+        _cxba_case_memory_loaded_marker=case_memory_marker(
+            "stored-in-place-compression", context
+        ),
+    )
+    server._sessions["sid-in-place-compression"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid-in-place-compression",
+            "sid-in-place-compression",
+            session,
+            "ordinary turn",
+            trusted_run_context=context,
+        ) is True
+
+        assert len(turns) == 1
+        assert "read /case/Memory.md completely" not in turns[0]
+        assert "_cxba_case_memory_loaded_marker" not in session
+    finally:
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-in-place-compression", None)
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])

@@ -436,6 +436,17 @@ def _(rid, params: dict) -> dict:
         from tui_gateway.transport import has_cxba_private_authority
 
         stored_cxba_binding = binding_from_model_config(found.get("model_config"))
+        suppress_auto_continue = is_truthy_value(
+            params.get("suppress_auto_continue", False)
+        )
+        if suppress_auto_continue and (
+            stored_cxba_binding is None or not has_cxba_private_authority()
+        ):
+            return _err(
+                rid,
+                4033,
+                "suppress_auto_continue requires a trusted CXBA private connection",
+            )
         raw_model_config = found.get("model_config")
         if isinstance(raw_model_config, str):
             try:
@@ -510,7 +521,10 @@ def _(rid, params: dict) -> dict:
                 payload["status"] = "streaming"
             return payload
 
-        # Fast path: if the session is already live, reuse it under the lock.
+        # Fast path: if the session is already live, reuse it. A trusted caller
+        # can require an eager agent because approval continuation cannot accept
+        # an RPC and then discover that a deferred live record has no agent.
+        live = None
         with _session_resume_lock:
             if (
                 stored_cxba_binding is not None
@@ -523,8 +537,16 @@ def _(rid, params: dict) -> dict:
                     rid, 4100, "CXBA business Session is retired and cannot resume"
                 )
             live = _find_live_session_by_key(target)
-            if live is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+        if live is not None:
+            live_sid, live_session = live
+            if (
+                is_truthy_value(params.get("eager_build", False))
+                and live_session.get("agent") is None
+            ):
+                _start_agent_build(live_sid, live_session)
+                if build_error := _wait_agent(live_session, rid):
+                    return build_error
+            return _ok(rid, _reuse_live_payload(live_sid, live_session))
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
         # Used by the desktop's subagent windows — the child runs inside the
@@ -669,7 +691,11 @@ def _(rid, params: dict) -> dict:
 
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
-            auto_continue = _maybe_schedule_auto_continue(sid, record, target)
+            auto_continue = (
+                None
+                if suppress_auto_continue
+                else _maybe_schedule_auto_continue(sid, record, target)
+            )
 
             messages = [] if omit_messages else _history_to_messages(
                 display_history, include_raw_indexes=stored_cxba_binding is not None
@@ -907,7 +933,9 @@ def _(rid, params: dict) -> dict:
             with contextlib.suppress(Exception):
                 db.close()
     auto_continue = (
-        _maybe_schedule_auto_continue(sid, session, target) if session else None
+        _maybe_schedule_auto_continue(sid, session, target)
+        if session and not suppress_auto_continue
+        else None
     )
     payload = {
         "session_id": sid,
@@ -3459,28 +3487,104 @@ def _(rid, params: dict) -> dict:
     session = _sessions.get(sid)
     if session is None:
         return _err(rid, 4004, "session not found")
+    recovered_continuation = "run_context" in params or "case_context" in params
+    if recovered_continuation and (
+        "run_context" not in params or "case_context" not in params
+    ):
+        return _err(
+            rid,
+            4039,
+            "recovered approval continuation requires run_context and case_context",
+        )
+    continuation_created = False
     try:
         from tui_gateway.cxba_runtime import (
             approval_prompt,
             approval_events_snapshot,
+            attach_run,
+            detach_completed_run,
             discard_queued_approval_result,
-            drain_approval_events,
             get_run,
             queue_approval_result,
+            run_for_session,
+            validate_case_context,
+            validate_case_context_matches_binding,
+            validate_run_matches_binding,
         )
 
-        run = get_run(run_id)
-        if run is None or run.runtime_session_id != sid:
-            return _err(rid, 4040, "Run does not belong to the runtime session")
+        if recovered_continuation:
+            with session["history_lock"]:
+                if session.get("running"):
+                    return _err(
+                        rid,
+                        4091,
+                        "recovered Session is busy; retry approval delivery explicitly",
+                    )
+                if session.get("agent") is None:
+                    return _err(
+                        rid,
+                        5032,
+                        "recovered Session agent is not ready; retry approval delivery explicitly",
+                    )
+            try:
+                from tools.run_sandbox import validate_run_context
+
+                trusted_run_context = validate_run_context(params.get("run_context"))
+                trusted_case_context = validate_case_context(params.get("case_context"))
+                validate_run_matches_binding(
+                    session.get("cxba_binding"), trusted_run_context
+                )
+                validate_case_context_matches_binding(
+                    session.get("cxba_binding"), trusted_case_context
+                )
+            except (OSError, ValueError) as exc:
+                return _err(rid, 4038, f"invalid recovered approval context: {exc}")
+            if trusted_run_context.run_id != run_id:
+                return _err(rid, 4038, "run_context run_id does not match run_id")
+            active_run = run_for_session(sid)
+            if active_run is not None and active_run.run_id != run_id:
+                return _err(
+                    rid,
+                    4093,
+                    "runtime session already has a different active Run",
+                )
+            run, continuation_created = attach_run(
+                run_context=trusted_run_context,
+                stored_session_id=str(session.get("session_key") or ""),
+                runtime_session_id=sid,
+                case_context=trusted_case_context,
+            )
+            session["active_cxba_run_id"] = run_id
+        else:
+            run = get_run(run_id)
+            if run is None or run.runtime_session_id != sid:
+                return _err(rid, 4040, "Run does not belong to the runtime session")
         event = queue_approval_result(
             run_id,
             proposal_id=proposal_id,
             status=status,
             content=params.get("content"),
             pending_count=pending_count,
+            source_run_id=str(params.get("source_run_id") or "").strip() or None,
         )
-        prompt = approval_prompt(event)
         _emit("approval.result", sid, event)
+        if pending_count > 0:
+            _emit(
+                "approval.result.queued",
+                sid,
+                {"proposal_id": proposal_id, "pending_count": pending_count},
+            )
+            return _ok(
+                rid,
+                {
+                    "status": "queued",
+                    "run_id": run_id,
+                    "pending_count": pending_count,
+                },
+            )
+
+        prompts = [approval_prompt(item) for item in approval_events_snapshot(run_id)]
+        prompt = "\n\n".join(prompts)
         with session["history_lock"]:
             running = bool(session.get("running"))
             agent = session.get("agent")
@@ -3489,24 +3593,28 @@ def _(rid, params: dict) -> dict:
         if running:
             if agent is None or not hasattr(agent, "steer") or not agent.steer(prompt):
                 discard_queued_approval_result(run_id, event)
+                if continuation_created:
+                    detach_completed_run(run_id, "FAILED")
                 return _err(rid, 4091, "active Run could not accept the approval result")
             session["_cxba_approval_steer_pending"] = True
             _emit("approval.result.queued", sid, {"proposal_id": proposal_id})
             return _ok(rid, {"status": "queued", "run_id": run_id})
 
-        prompts = [approval_prompt(item) for item in approval_events_snapshot(run_id)]
         started = _run_prompt_submit(
             rid,
             sid,
             session,
-            "\n\n".join(prompts),
+            prompt,
             display_kind="cxba_approval_result",
             display_metadata={"proposal_id": proposal_id, "status": event["status"]},
             trusted_run_context=run.context,
+            trusted_case_context=run.case_context,
             consumes_cxba_approvals=True,
         )
         if not started:
             discard_queued_approval_result(run_id, event)
+            if continuation_created:
+                detach_completed_run(run_id, "FAILED")
             with session["history_lock"]:
                 session["running"] = False
             return _err(
@@ -3516,6 +3624,8 @@ def _(rid, params: dict) -> dict:
             )
         return _ok(rid, {"status": "continuing", "run_id": run_id})
     except (KeyError, ValueError) as exc:
+        if continuation_created:
+            detach_completed_run(run_id, "FAILED")
         with session["history_lock"]:
             if not session.get("_run_thread"):
                 session["running"] = False

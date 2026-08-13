@@ -2,7 +2,7 @@ model:
   provider: custom:cxba-bailian
   default: "${env:CXBA_LOCAL_MODEL}"
   base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
-  context_length: 262144
+  context_length: 65536
 
 fallback_providers: []
 

@@ -5,6 +5,8 @@ description: Reconcile overlapping Excel workbooks, CSV exports, summary tables,
 
 # Source Reconciliation
 
+读取来源内容前加载`cxba-analysis-notebook`，逐文件即时记录来源结构、覆盖、主要内容、可能用途、冲突线索和精确定位。本Skill产生进入最终回答的事实、计算、来源关系或缺口时加载`cxba-claim-delivery`。
+
 先识别来源关系，再规范化，再对账。不要直接把多份表拼接后求和，也不要修改原始文件。
 
 ## 工作流

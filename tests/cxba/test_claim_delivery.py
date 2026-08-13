@@ -156,7 +156,7 @@ def test_calculation_requires_existing_script_and_result(tmp_path):
     assert delivered["evidence_errors"] == ["calculation_script_missing"]
 
 
-def test_prepare_removes_previous_turn_result(tmp_path):
+def test_prepare_removes_previous_run_result(tmp_path):
     run, workspace = _run(tmp_path)
     _write_claims(workspace, [_fact_claim()])
 

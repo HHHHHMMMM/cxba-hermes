@@ -9,6 +9,30 @@ process.
 
 The shipped config resolves the model name and endpoint from deployment environment variables. Missing local model configuration must fail explicitly, and `fallback_providers` stays empty so the Run does not switch to an external model.
 
+Every CXBA material-analysis Run first loads `cxba-analysis-router`. The Router
+selects the smallest focused, reconciliation, pattern, temporal, full-case, or
+review workflow. All material-reading workflows share `cxba-analysis-notebook`
+for immediate per-file external memory, and all material-derived final answers
+share `cxba-claim-delivery` for source-located claims. A new technique therefore
+adds one Router branch, one specialist Skill, and its contract tests without
+copying the notebook or claim format.
+
+`scripts/cxba-gateway.sh start` copies this managed profile's complete Skill
+directories into the runtime profile before startup. This keeps references,
+scripts, and agents together with `SKILL.md`; adding a resourceful specialist
+Skill must not result in a runtime installation containing only its entry file.
+
+The Workbench deep-thinking switch is session-scoped.  The Bailian provider
+declares `extra_body.enable_thinking`; a local llama.cpp/vLLM provider must
+instead declare the server-supported nested switch so Hermes can update it for
+each Run without affecting other Sessions:
+
+```yaml
+extra_body:
+  chat_template_kwargs:
+    enable_thinking: false
+```
+
 Set these deployment environment variables before starting Hermes; the profile
 contains references only and never stores their values:
 

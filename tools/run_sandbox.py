@@ -86,7 +86,9 @@ def _normalize_target(value: Any) -> str:
     if ".." in raw_parts:
         raise ValueError("run_context mount target must not contain '..'")
     target = str(PurePosixPath(value))
-    fixed_targets = {"/data", "/workspace", "/exchange/current", "/shared"}
+    fixed_targets = {
+        "/data", "/workspace", "/exchange/current", "/shared", "/case/Memory.md"
+    }
     parts = PurePosixPath(target).parts
     scoped_target = bool(
         len(parts) == 3
@@ -159,9 +161,21 @@ def validate_run_context(raw: Any, *, storage_root: Path | None = None) -> Trust
         if read_only == writable:
             required = "writable" if writable else "read-only"
             raise ValueError(f"run_context mount {target} must be {required}")
+        if target == "/case/Memory.md":
+            expected_memory = root / "cases" / case_id / "Memory.md"
+            if (
+                Path(source_value) != expected_memory
+                or Path(source_value).is_symlink()
+                or not source.is_file()
+            ):
+                raise ValueError(
+                    "run_context /case/Memory.md source must be the current case Memory.md regular file"
+                )
         mounts.append(RunMount(str(source), target, read_only))
 
-    required_targets = {"/data", "/workspace", "/exchange/current", "/shared"}
+    required_targets = {
+        "/data", "/workspace", "/exchange/current", "/shared", "/case/Memory.md"
+    }
     missing = required_targets - targets
     if missing:
         raise ValueError(f"run_context is missing required mount targets: {', '.join(sorted(missing))}")

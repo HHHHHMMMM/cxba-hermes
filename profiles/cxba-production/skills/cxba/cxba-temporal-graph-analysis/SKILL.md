@@ -5,6 +5,8 @@ description: Discover reproducible time patterns and candidate transaction chain
 
 # CXBA Temporal Graph Analysis
 
+读取交易材料内容前加载`cxba-analysis-notebook`，逐文件即时记录真实结构、覆盖、主要内容、可用字段、候选及反证定位。本Skill产生进入最终回答的统计事实、时序候选或缺口时加载`cxba-claim-delivery`。
+
 ## Mandatory execution path
 1. On every start or resume, inspect `/workspace/scripts` and `/workspace/results`; reuse valid artifacts and continue at the next unfinished step.
 2. Inspect the source and read [event-contract.md](references/event-contract.md), then create or reuse exactly one source adapter under `/workspace/scripts`; fix it in place.

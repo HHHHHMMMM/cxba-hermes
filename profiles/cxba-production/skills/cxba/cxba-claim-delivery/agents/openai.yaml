@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA Claim Delivery"
+  short_description: "Deliver traceable CXBA claims with source and calculation checks"
+  default_prompt: "Use $cxba-claim-delivery to bind every final case statement to verifiable source evidence."

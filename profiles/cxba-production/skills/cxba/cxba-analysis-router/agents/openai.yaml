@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA Analysis Router"
+  short_description: "Route each CXBA request to the smallest valid analysis workflow"
+  default_prompt: "Use $cxba-analysis-router first, then load only the selected analysis Skills."

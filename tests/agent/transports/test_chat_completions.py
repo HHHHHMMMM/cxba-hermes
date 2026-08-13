@@ -48,6 +48,49 @@ class TestChatCompletionsBasic:
         assert kwargs["extra_body"]["caller_only"] == "kept"
         assert configured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
 
+    @pytest.mark.parametrize(
+        ("reasoning_config", "expected"),
+        [
+            ({"enabled": True, "effort": "medium"}, True),
+            ({"enabled": False, "effort": "none"}, False),
+        ],
+    )
+    def test_configured_bailian_thinking_follows_session_toggle(
+        self, transport, reasoning_config, expected
+    ):
+        configured = {
+            "extra_body": {
+                "enable_thinking": False,
+                "caller_only": "kept",
+            }
+        }
+
+        kwargs = transport.build_kwargs(
+            model="qwen3.6-27b",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config=reasoning_config,
+            request_overrides=configured,
+        )
+
+        assert kwargs["extra_body"]["enable_thinking"] is expected
+        assert kwargs["extra_body"]["caller_only"] == "kept"
+        assert configured["extra_body"]["enable_thinking"] is False
+
+    def test_thinking_toggle_does_not_add_undeclared_wire_field(self, transport):
+        configured = {"extra_body": {"caller_only": "kept"}}
+
+        kwargs = transport.build_kwargs(
+            model="qwen3.6-27b",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "medium"},
+            request_overrides=configured,
+        )
+
+        assert kwargs["extra_body"] == {"caller_only": "kept"}
+        assert configured == {"extra_body": {"caller_only": "kept"}}
+
 
 
     @pytest.mark.parametrize("provider", ["nous", "openrouter"])

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,9 +8,13 @@ import pytest
 from tools.run_sandbox import RunMount, TrustedRunContext
 from tui_gateway.cxba_runtime import (
     add_event,
+    approval_prompt,
     attach_run,
     binding_system_context,
     case_context_model_prompt,
+    case_memory_marker,
+    case_memory_reload_prompt,
+    case_memory_read_completed,
     discard_queued_approval_result,
     drain_approval_events,
     fetch_events,
@@ -54,13 +59,19 @@ def _case_context(material_catalog=None) -> dict:
 def _run(tmp_path: Path, run_id: str = "run-1") -> TrustedRunContext:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
+    memory = tmp_path / "cases" / "case-1" / "Memory.md"
+    memory.parent.mkdir(parents=True, exist_ok=True)
+    memory.write_text("# 案件长期记忆\n", encoding="utf-8")
     return TrustedRunContext(
         case_id="case-1",
         business_session_id="session-1",
         business_branch_id="branch-1",
         run_id=run_id,
         actor_user_id="user-1",
-        mounts=(RunMount(str(workspace), "/workspace", False),),
+        mounts=(
+            RunMount(str(workspace), "/workspace", False),
+            RunMount(str(memory), "/case/Memory.md", True),
+        ),
     )
 
 
@@ -72,6 +83,11 @@ def test_session_binding_is_stable_and_run_context_is_dynamic() -> None:
 
     assert "测试案件" not in system_context
     assert "material-1" not in system_context
+    assert "cxba-analysis-router" in system_context
+    assert "cxba-analysis-notebook" in system_context
+    assert "cxba-claim-delivery" in system_context
+    assert "/case/Memory.md" in system_context
+    assert "cxba_propose_case_memory_update" in system_context
     injected = json.loads(system_context.rsplit("\n", 1)[-1])
     assert set(injected) == {
         "case_id",
@@ -81,6 +97,99 @@ def test_session_binding_is_stable_and_run_context_is_dynamic() -> None:
     assert "测试案件" in run_prompt
     assert '"count":1' in run_prompt
     assert "material-1" not in run_prompt
+
+
+def test_case_memory_reloads_on_first_run_change_and_session_key_rotation(
+    tmp_path: Path,
+) -> None:
+    run = _run(tmp_path)
+
+    first_prompt, first_marker = case_memory_reload_prompt("stored-1", run, None)
+    same_prompt, same_marker = case_memory_reload_prompt(
+        "stored-1", run, first_marker
+    )
+    memory = Path(next(m.source for m in run.mounts if m.target == "/case/Memory.md"))
+    original_mtime = memory.stat().st_mtime_ns
+    memory.write_text("# 案件长期记忆\n\n已更新\n", encoding="utf-8")
+    if memory.stat().st_mtime_ns == original_mtime:
+        os.utime(memory, ns=(memory.stat().st_atime_ns, original_mtime + 1_000_000))
+    changed_prompt, changed_marker = case_memory_reload_prompt(
+        "stored-1", run, first_marker
+    )
+    rotated_prompt, rotated_marker = case_memory_reload_prompt(
+        "stored-2", run, changed_marker
+    )
+
+    assert first_prompt and "read /case/Memory.md completely" in first_prompt
+    assert "acknowledgement-only" in first_prompt
+    assert same_prompt is None
+    assert same_marker == first_marker
+    assert changed_prompt
+    assert changed_marker != first_marker
+    assert rotated_prompt
+    assert rotated_marker[0] == "stored-2"
+    assert case_memory_marker("stored-2", run) == rotated_marker
+
+
+def test_case_memory_read_completion_requires_a_full_read_in_the_current_turn() -> None:
+    prior = {
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "old-read",
+            "function": {"name": "read_file", "arguments": '{"path":"/case/Memory.md"}'},
+        }],
+    }
+    prior_result = {
+        "role": "tool",
+        "tool_call_id": "old-read",
+        "content": '{"truncated":false}',
+    }
+    skipped = [prior, prior_result, {"role": "user", "content": "current"}, {"role": "assistant", "content": "ok"}]
+    complete = [
+        *skipped,
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "current-read",
+                "function": {"name": "read_file", "arguments": '{"path":"/case/Memory.md"}'},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "current-read",
+            "content": '{"truncated":false}',
+        },
+    ]
+    truncated = [
+        *complete[:-1],
+        {
+            "role": "tool",
+            "tool_call_id": "current-read",
+            "content": '{"truncated":true}',
+        },
+    ]
+
+    assert case_memory_read_completed(skipped, "current") is False
+    assert case_memory_read_completed(truncated, "current") is False
+    assert case_memory_read_completed(complete, "current") is True
+
+
+def test_executed_case_memory_approval_requires_immediate_reload() -> None:
+    executed = approval_prompt(
+        {
+            "status": "EXECUTED",
+            "content": {"proposalType": "CASE_MEMORY"},
+        }
+    )
+    rejected = approval_prompt(
+        {
+            "status": "REJECTED",
+            "content": {"proposalType": "CASE_MEMORY"},
+        }
+    )
+
+    assert "Read /case/Memory.md completely" in executed
+    assert "Read /case/Memory.md completely" not in rejected
 
 
 def test_session_binding_rejects_unexpected_business_fields() -> None:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
+from agent.agent_init import _merge_custom_provider_extra_body
+from agent.transports import get_transport
 from hermes_cli.profile_distribution import read_manifest
 from toolsets import resolve_toolset
 from tools.skills_sync import _discover_bundled_skills
@@ -84,6 +87,29 @@ def test_local_model_must_be_deployment_configured() -> None:
     assert provider["name"] == "cxba-bailian"
     assert provider["key_env"] == "CXBA_BAILIAN_API_KEY"
     assert provider["extra_body"] == {"enable_thinking": False}
+
+
+def test_production_provider_thinking_follows_each_session_reasoning_setting() -> None:
+    config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
+    agent = SimpleNamespace(
+        provider=config["model"]["provider"],
+        model=config["model"]["default"],
+        base_url=config["model"]["base_url"],
+        request_overrides={},
+    )
+    _merge_custom_provider_extra_body(agent, config["custom_providers"])
+    transport = get_transport("chat_completions")
+
+    for enabled, effort in ((True, "medium"), (False, "none")):
+        kwargs = transport.build_kwargs(
+            model=agent.model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": enabled, "effort": effort},
+            request_overrides=agent.request_overrides,
+        )
+
+        assert kwargs["extra_body"]["enable_thinking"] is enabled
 
 
 def test_private_gateway_storage_and_spring_mcp_are_environment_bound() -> None:

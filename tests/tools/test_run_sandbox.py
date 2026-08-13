@@ -22,6 +22,10 @@ def _context(root: Path, session_id: str = "session-1") -> dict:
         path = root / name
         path.mkdir()
         sources[name] = str(path)
+    memory = root / "cases" / "case-1" / "Memory.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# 案件长期记忆\n", encoding="utf-8")
+    sources["memory"] = str(memory)
     return {
         "case_id": "case-1",
         "business_session_id": session_id,
@@ -42,6 +46,11 @@ def _context(root: Path, session_id: str = "session-1") -> dict:
                 "read_only": False,
             },
             {"source": sources["shared"], "target": "/shared", "read_only": True},
+            {
+                "source": sources["memory"],
+                "target": "/case/Memory.md",
+                "read_only": True,
+            },
         ],
     }
 
@@ -50,8 +59,19 @@ def test_validate_run_context_accepts_exact_mount_policy(tmp_path):
     context = validate_run_context(_context(tmp_path), storage_root=tmp_path)
     assert context.run_id == "run-1"
     assert {mount.target for mount in context.mounts} == {
-        "/data", "/workspace", "/case-sessions/session-1", "/exchange/current", "/shared"
+        "/data", "/workspace", "/case-sessions/session-1", "/exchange/current",
+        "/shared", "/case/Memory.md"
     }
+
+
+def test_validate_run_context_rejects_case_memory_from_another_path(tmp_path):
+    raw = _context(tmp_path)
+    wrong = tmp_path / "wrong-memory.md"
+    wrong.write_text("wrong", encoding="utf-8")
+    raw["mounts"][-1]["source"] = str(wrong)
+
+    with pytest.raises(ValueError, match="current case Memory.md"):
+        validate_run_context(raw, storage_root=tmp_path)
 
 
 def test_configured_storage_root_surfaces_config_load_failure(monkeypatch):

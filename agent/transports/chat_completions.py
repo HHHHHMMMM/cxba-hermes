@@ -94,23 +94,25 @@ def _reasoning_aware_request_overrides(
     request_overrides: dict | None,
     reasoning_config: dict | None,
 ) -> dict | None:
-    """Apply a per-turn toggle to an explicitly configured chat template switch.
+    """Apply the per-turn toggle to an explicitly configured thinking switch.
 
-    Local llama.cpp-compatible servers expose model-specific thinking through
-    ``chat_template_kwargs.enable_thinking`` instead of the generic OpenRouter
-    ``reasoning`` object.  The static custom-provider body opts into that wire
-    contract; this function only changes the configured boolean and never adds
-    the field to endpoints that did not declare it.
+    Bailian-compatible Qwen endpoints use ``extra_body.enable_thinking`` while
+    local llama.cpp/vLLM-compatible servers commonly use
+    ``chat_template_kwargs.enable_thinking``.  The custom-provider body opts
+    into one of those wire contracts; this function only changes configured
+    booleans and never adds a field to endpoints that did not declare it.
     """
     if not isinstance(request_overrides, dict) or not isinstance(reasoning_config, dict):
         return request_overrides
     extra_body = request_overrides.get("extra_body")
     if not isinstance(extra_body, dict):
         return request_overrides
+    top_level_configured = isinstance(extra_body.get("enable_thinking"), bool)
     template_kwargs = extra_body.get("chat_template_kwargs")
-    if not isinstance(template_kwargs, dict) or not isinstance(
+    nested_configured = isinstance(template_kwargs, dict) and isinstance(
         template_kwargs.get("enable_thinking"), bool
-    ):
+    )
+    if not top_level_configured and not nested_configured:
         return request_overrides
 
     enabled = reasoning_config.get("enabled") is not False
@@ -118,9 +120,12 @@ def _reasoning_aware_request_overrides(
         enabled = False
     updated = dict(request_overrides)
     updated_body = dict(extra_body)
-    updated_template = dict(template_kwargs)
-    updated_template["enable_thinking"] = enabled
-    updated_body["chat_template_kwargs"] = updated_template
+    if top_level_configured:
+        updated_body["enable_thinking"] = enabled
+    if nested_configured:
+        updated_template = dict(template_kwargs)
+        updated_template["enable_thinking"] = enabled
+        updated_body["chat_template_kwargs"] = updated_template
     updated["extra_body"] = updated_body
     return updated
 

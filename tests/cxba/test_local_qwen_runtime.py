@@ -109,6 +109,10 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
         path = storage_root / name
         path.mkdir()
         mount_paths[name] = path
+    memory = storage_root / "cases" / case_id / "Memory.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# 案件长期记忆\n", encoding="utf-8")
+    mount_paths["memory"] = memory
 
     binding = {
         "case_id": case_id,
@@ -152,6 +156,11 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
                 {
                     "source": str(mount_paths["shared"]),
                     "target": "/shared",
+                    "read_only": True,
+                },
+                {
+                    "source": str(mount_paths["memory"]),
+                    "target": "/case/Memory.md",
                     "read_only": True,
                 },
             ],

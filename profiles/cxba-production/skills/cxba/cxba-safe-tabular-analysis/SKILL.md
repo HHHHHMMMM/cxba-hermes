@@ -5,6 +5,8 @@ description: 在Hermes隔离容器中可靠盘点、定位、聚合和交叉核�
 
 # CXBA可靠表格分析
 
+读取表格内容前加载`cxba-analysis-notebook`；每完成一个工作簿或其他物理文件的本轮处理，先更新逐文件笔记再切换文件。本Skill产生进入最终回答的事实、计算或缺口时加载`cxba-claim-delivery`。
+
 ## 专项分析路由
 
 先识别用户要求的分析类型，再进入计算：
@@ -66,6 +68,8 @@ python3 \
 - 日期失败、空值、负数、退款、冲正和重复键分别计数；不同币种不直接相加。
 - 跨来源合计前先确认是否存在重复记录或汇总/明细重叠；无法确认时分别报告。
 - 输出至少包含`metric`、`value`、`rowCount`、`filters`、`dedupKeys`、`sourceRefs`和`limitations`。
+- `.xlsx/.xls`是二进制工作簿，禁止用`read_text()`或字符集参数读取；CSV/TSV才按文本编码识别。生成Excel后必须用工作簿解析器重新打开，核对Sheet、行列数、关键汇总值和公式错误。
+- 需要发布数字或Excel等结果文件时，同时生成UTF-8 JSON计算结果并遵守`cxba-claim-delivery`的`metricCodes`、`publishedMetrics`、`artifactPaths`和`reportBlock`勾稽；原始数据复算值、交付物回读值和最终回复不一致时不得交付。
 - 终端输出被截断时，以落盘结果为准并按字段或范围读取，不引用截断片段。
 
 工具执行边界见[tool-safety.md](references/tool-safety.md)。

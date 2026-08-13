@@ -77,7 +77,7 @@ def _existing_regular_file(root: Path, relative: PurePosixPath, *, code: str) ->
 
 
 def prepare_claim_delivery(run: Any) -> None:
-    """Remove the previous turn's bounded result before a new turn starts."""
+    """Remove the previous Run's bounded result before a new Run starts."""
     root = _workspace_root(run)
     if root is None:
         return

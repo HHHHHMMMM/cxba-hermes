@@ -379,6 +379,21 @@ def _(rid, params: dict) -> dict:
             5071,
             f"session storage could not be written: {exc}",
         )
+    if trusted_run_context is not None:
+        try:
+            _prepare_cxba_run_for_prompt(
+                sid,
+                session,
+                trusted_run_context,
+                trusted_case_context,
+                attach_only=True,
+            )
+        except Exception as exc:
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            return _err(rid, 5031, f"failed to prepare trusted Run: {exc}")
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:

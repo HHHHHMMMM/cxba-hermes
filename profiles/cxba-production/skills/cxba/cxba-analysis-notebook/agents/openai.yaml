@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA Analysis Notebook"
+  short_description: "Record each CXBA file immediately with exact evidence locations"
+  default_prompt: "Use $cxba-analysis-notebook before reading case materials and update it after every file."

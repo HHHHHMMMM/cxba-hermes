@@ -10,6 +10,7 @@ PORT=${CXBA_GATEWAY_PORT:-9119}
 SPRING_PORT=${CXBA_SPRING_PORT:-8290}
 HERMES_BIN=${CXBA_HERMES_BIN:-"${PROJECT_DIR}/.venv/bin/hermes"}
 PROFILE_HOME=${CXBA_HERMES_PROFILE_HOME:-"${HOME}/.hermes/profiles/${PROFILE}"}
+PROFILE_SOURCE=${CXBA_HERMES_PROFILE_SOURCE:-"${PROJECT_DIR}/profiles/${PROFILE}"}
 LOG_FILE=${CXBA_GATEWAY_LOG_FILE:-"${PROFILE_HOME}/logs/cxba-gateway-service.log"}
 PID_FILE=${CXBA_GATEWAY_PID_FILE:-"${PROFILE_HOME}/cxba-gateway.pid"}
 ENV_FILE=${CXBA_GATEWAY_ENV_FILE:-"${PROJECT_DIR}/config/hermes-gateway.env"}
@@ -189,6 +190,14 @@ check_model() {
 	fi
 }
 
+sync_managed_profile_skills() {
+	local source_skills="${PROFILE_SOURCE}/skills"
+	local target_skills="${PROFILE_HOME}/skills"
+	[[ -d "${source_skills}" ]] || return 0
+	mkdir -p "${target_skills}"
+	cp -R "${source_skills}/." "${target_skills}/"
+}
+
 start_gateway() {
 	local pid gateway_command
 	pid=$(listener_pid)
@@ -205,6 +214,7 @@ start_gateway() {
 	command -v tmux >/dev/null 2>&1 || { echo "tmux is required to run Hermes Gateway persistently." >&2; return 1; }
 	prepare_environment
 	check_model
+	sync_managed_profile_skills
 	mkdir -p "$(dirname "${LOG_FILE}")" "$(dirname "${PID_FILE}")"
 
 	if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then

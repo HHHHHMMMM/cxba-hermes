@@ -10000,6 +10000,110 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _prepare_cxba_run_for_prompt(
+    sid: str,
+    session: dict,
+    trusted_run_context,
+    trusted_case_context: dict[str, Any] | None,
+    *,
+    attach_only: bool = False,
+    reuse_prepared: bool = False,
+):
+    """Attach before acknowledgement; start sandbox ownership with execution."""
+    from tui_gateway.cxba_runtime import (
+        attach_run,
+        detach_completed_run,
+        get_run,
+    )
+
+    run_id = trusted_run_context.run_id
+    cxba_run = None
+    created = False
+    claim_reset_required = False
+    prepared_marker = None
+    if reuse_prepared:
+        prepared_marker = session.pop("_cxba_prepared_run", None)
+    if (
+        isinstance(prepared_marker, dict)
+        and prepared_marker.get("run_id") == run_id
+    ):
+        prepared = get_run(run_id)
+        if prepared is not None and prepared.runtime_session_id == sid:
+            cxba_run = prepared
+            created = bool(prepared_marker.get("created"))
+            claim_reset_required = bool(
+                prepared_marker.get("claim_reset_required")
+            )
+
+    try:
+        if cxba_run is None:
+            cxba_run, created = attach_run(
+                run_context=trusted_run_context,
+                stored_session_id=str(session.get("session_key") or ""),
+                runtime_session_id=sid,
+                case_context=trusted_case_context,
+            )
+            # ``created`` also covers recovery after a Gateway restart. An
+            # existing durable event stream proves this business Run already
+            # started, so its retained workspace must not be reset again.
+            claim_reset_required = created and not bool(
+                getattr(cxba_run, "events", ())
+            )
+            session["active_cxba_run_id"] = run_id
+            _emit(
+                "run.started" if created else "run.continued",
+                sid,
+                {"status": cxba_run.status},
+            )
+
+        if attach_only:
+            session["_cxba_prepared_run"] = {
+                "run_id": run_id,
+                "created": created,
+                "claim_reset_required": claim_reset_required,
+            }
+            return cxba_run
+
+        from tools.run_sandbox import register_run_sandbox
+        from tui_gateway.cxba_runtime import mark_sandbox_registered
+
+        if not cxba_run.sandbox_registered:
+            register_run_sandbox(trusted_run_context)
+            mark_sandbox_registered(run_id)
+            _emit("sandbox.started", sid, {"status": "RUNNING"})
+
+        # A Session workspace survives across Runs, so clear the prior Run's
+        # bounded claim result once when this Run is first attached. Synthetic
+        # background/subagent continuations belong to the same Run and must
+        # retain its workspace artifacts; clearing on every continuation made
+        # final-claims.json disappear immediately after a model wrote it.
+        if claim_reset_required:
+            from tui_gateway.cxba_claims import prepare_claim_delivery
+
+            prepare_claim_delivery(cxba_run)
+        return cxba_run
+    except Exception:
+        if created:
+            try:
+                from tools.run_sandbox import destroy_run_sandbox
+
+                destroy_run_sandbox(run_id)
+            except Exception:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(run_id)
+                logger.error(
+                    "event=run_sandbox stage=prepare_compensation status=failed runId=%s",
+                    run_id,
+                    exc_info=True,
+                )
+            detach_completed_run(run_id, "FAILED")
+            if session.get("active_cxba_run_id") == run_id:
+                session.pop("active_cxba_run_id", None)
+            session.pop("_cxba_prepared_run", None)
+        raise
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10027,53 +10131,20 @@ def _run_prompt_submit(
     cxba_run = None
     if trusted_run_context is not None:
         try:
-            from tui_gateway.cxba_runtime import attach_run
-
-            cxba_run, created = attach_run(
-                run_context=trusted_run_context,
-                stored_session_id=str(session.get("session_key") or ""),
-                runtime_session_id=sid,
-                case_context=trusted_case_context,
-            )
-            session["active_cxba_run_id"] = trusted_run_context.run_id
-            _emit(
-                "run.started" if created else "run.continued",
+            cxba_run = _prepare_cxba_run_for_prompt(
                 sid,
-                {"status": cxba_run.status},
+                session,
+                trusted_run_context,
+                trusted_case_context,
+                reuse_prepared=True,
             )
-        except Exception as exc:
-            with session["history_lock"]:
-                session["running"] = False
-            _emit("error", sid, {"message": f"failed to attach trusted Run: {exc}"})
-            return False
-        try:
-            from tools.run_sandbox import register_run_sandbox
-            from tui_gateway.cxba_runtime import mark_sandbox_registered
-
-            if not cxba_run.sandbox_registered:
-                register_run_sandbox(trusted_run_context)
-                mark_sandbox_registered(trusted_run_context.run_id)
-                _emit("sandbox.started", sid, {"status": "RUNNING"})
         except Exception as exc:
             with session["history_lock"]:
                 session["running"] = False
             _emit(
                 "error",
                 sid,
-                {"message": f"failed to register trusted Run sandbox: {exc}"},
-            )
-            return False
-        try:
-            from tui_gateway.cxba_claims import prepare_claim_delivery
-
-            prepare_claim_delivery(cxba_run)
-        except Exception as exc:
-            with session["history_lock"]:
-                session["running"] = False
-            _emit(
-                "error",
-                sid,
-                {"message": f"failed to prepare CXBA claim delivery: {exc}"},
+                {"message": f"failed to prepare trusted Run: {exc}"},
             )
             return False
     with session["history_lock"]:
@@ -10123,6 +10194,12 @@ def _run_prompt_submit(
         turn_error_retained = False
         turn_failed = False
         run_sandbox_binding = None
+        case_memory_marker_to_commit = None
+        case_memory_reload_required = False
+        case_memory_compression_count_before = int(
+            getattr(getattr(agent, "context_compressor", None), "compression_count", 0)
+            or 0
+        )
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -10343,20 +10420,39 @@ def _run_prompt_submit(
                 elif isinstance(run_message, list):
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
-            # Current case data belongs only to this new model input. Keeping it
-            # out of the persisted user message and stable system prompt preserves
-            # both a clean transcript and provider prefix caching.
+            # Current case data and a cheap case-memory reload notice belong only
+            # to this new model input. The memory body itself stays in the mounted
+            # file, preserving a clean transcript and provider prefix caching.
             if cxba_run is not None:
-                from tui_gateway.cxba_runtime import case_context_model_prompt
+                from tui_gateway.cxba_runtime import (
+                    case_context_model_prompt,
+                    case_memory_reload_prompt,
+                )
 
+                trusted_notes = []
                 if current_case_note := case_context_model_prompt(cxba_run.case_context):
-                    if isinstance(run_message, str):
-                        run_message = f"{current_case_note}\n\n{run_message}"
-                    elif isinstance(run_message, list):
-                        run_message = [
-                            {"type": "text", "text": current_case_note},
-                            *run_message,
-                        ]
+                    trusted_notes.append(current_case_note)
+                memory_note, case_memory_marker_to_commit = case_memory_reload_prompt(
+                    str(session.get("session_key") or ""),
+                    cxba_run.context,
+                    session.get("_cxba_case_memory_loaded_marker"),
+                )
+                if memory_note:
+                    case_memory_reload_required = True
+                if isinstance(run_message, str):
+                    run_message = "\n\n".join(
+                        [*trusted_notes, run_message, *([memory_note] if memory_note else [])]
+                    )
+                elif trusted_notes or memory_note:
+                    run_message = [
+                        *({"type": "text", "text": note} for note in trusted_notes),
+                        *run_message,
+                        *(
+                            [{"type": "text", "text": memory_note}]
+                            if memory_note
+                            else []
+                        ),
+                    ]
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -10582,6 +10678,34 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+
+            case_memory_compressed_this_turn = int(
+                getattr(getattr(agent, "context_compressor", None), "compression_count", 0)
+                or 0
+            ) > case_memory_compression_count_before
+            if case_memory_compressed_this_turn:
+                # In-place compaction keeps both the stored Session id and the
+                # Memory.md mtime unchanged. Forget the loaded marker so the
+                # next Run receives a fresh read instruction even without a
+                # Session rotation.
+                session.pop("_cxba_case_memory_loaded_marker", None)
+                case_memory_marker_to_commit = None
+            case_memory_read_succeeded = not case_memory_reload_required
+            if case_memory_reload_required and isinstance(result, dict):
+                from tui_gateway.cxba_runtime import case_memory_read_completed
+
+                case_memory_read_succeeded = case_memory_read_completed(
+                    result.get("messages"),
+                    prompt,
+                )
+            if (
+                status == "complete"
+                and case_memory_marker_to_commit is not None
+                and case_memory_read_succeeded
+            ):
+                session["_cxba_case_memory_loaded_marker"] = (
+                    case_memory_marker_to_commit
+                )
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if session.get("cxba_binding") is not None:
