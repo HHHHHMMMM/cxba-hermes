@@ -167,11 +167,13 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4039, f"case_context does not match the session binding: {exc}")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
-    if truncate_user_ordinal is not None and isinstance(text, str):
-        # A rewind/regenerate replays a turn from what the transcript shows. A
-        # skill turn shows its invocation, so re-expand it here — otherwise
-        # re-running `/work fix it` sends the agent nine literal characters
-        # instead of the skill it originally loaded.
+    if isinstance(text, str):
+        # The TUI normally expands a slash Skill through command.dispatch before
+        # prompt.submit. Trusted control-plane clients submit the same native
+        # invocation directly, while rewind/regenerate replays what the
+        # transcript shows. Expand both paths at this server boundary so the
+        # model receives the Skill body and every UI still stores/displays only
+        # the short invocation.
         text = _expand_skill_invocation_for_replay(
             text, str(session.get("session_key") or "")
         )

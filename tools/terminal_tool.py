@@ -3647,6 +3647,11 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "The command to execute on the VM"
             },
+            "description": {
+                "type": "string",
+                "minLength": 1,
+                "description": "A concise user-facing explanation of why this command is being run. Write it in the user's language; for Chinese, use a short action phrase suitable for display in the conversation."
+            },
             "background": {
                 "type": "boolean",
                 "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
@@ -3677,7 +3682,7 @@ TERMINAL_SCHEMA = {
                 "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
             }
         },
-        "required": ["command"]
+        "required": ["command", "description"]
     }
 }
 

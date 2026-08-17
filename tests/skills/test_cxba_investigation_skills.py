@@ -79,6 +79,17 @@ def test_focused_questions_route_away_from_full_case_investigation() -> None:
     assert "cxba-evidence-review" in interactive
 
 
+def test_full_case_skill_loads_only_after_trusted_mode_confirmation() -> None:
+    investigator = parse_skill("cxba-case-investigator")[1]
+
+    assert "可信Run上下文标明`FULL_CASE`" in investigator
+    assert "通过`skill_view`加载" in investigator
+    assert "Gateway负责加载前的案件准备和用户确认" in investigator
+    assert "不得再次询问同一轮启动确认" in investigator
+    assert "立即停止本Skill" in investigator
+    assert "先完成一次有界的全案准备" not in investigator
+
+
 def test_router_selects_minimal_primary_and_specialist_skills() -> None:
     metadata, router = parse_skill("cxba-analysis-router")
 
@@ -138,6 +149,56 @@ def test_common_notebook_requires_immediate_per_file_external_memory() -> None:
         assert phrase in notebook
     assert "专项任务只记录本轮实际处理的文件" in notebook
     assert "完整案件调查以其薄清单为母表" in notebook
+
+
+def test_investigation_knowledge_uses_read_only_vault_and_workspace_drafts() -> None:
+    metadata, body = parse_skill("cxba-investigation-knowledge")
+
+    assert metadata["name"] == "cxba-investigation-knowledge"
+    for phrase in (
+        "只读`/knowledge`",
+        "不使用RAG、向量库、GraphRAG",
+        "/workspace/knowledge-drafts/<source-run-id>/source-run.json",
+        "`draft.md`",
+        "`diff.md`",
+        "`manifest.json`",
+        "只写泛化方法",
+        "不得声称公共Vault已经写入",
+    ):
+        assert phrase in body
+
+
+def test_investigation_knowledge_produces_human_reviewable_business_markdown() -> None:
+    _, body = parse_skill("cxba-investigation-knowledge")
+
+    for phrase in (
+        "先判断这次是否真正形成了可供后续案件复用的方法",
+        "纯队列回执、Steer确认、运行诊断、寒暄",
+        "不要生成`draft.md`和`diff.md`",
+        "只能使用自然中文",
+        "不得照抄最终回答",
+		"一句自然中文的业务理由",
+        "办案人员审核和后续Agent读取的同一份正文",
+        "适用场景",
+        "所需材料",
+        "办理步骤",
+        "判断依据",
+        "反证与排除",
+        "适用边界",
+        "不得只写“综合分析”“关联核验”等空话",
+        "不得向办案人员罗列内部文件路径",
+    ):
+        assert phrase in body
+
+    assert "sensitiveFindings" not in body
+
+    for internal_term in (
+        "`finalAnswer`",
+        "`claims`",
+        "`materialReferences`",
+        "`manifest`",
+    ):
+        assert internal_term in body
 
 
 def test_focused_analysis_uses_generic_claim_delivery_preflight() -> None:

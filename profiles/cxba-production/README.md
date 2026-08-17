@@ -42,6 +42,7 @@ CXBA_LOCAL_MODEL_BASE_URL=<local OpenAI-compatible endpoint>
 CXBA_BAILIAN_API_KEY=<Bailian API key, required for the current production profile>
 CXBA_GATEWAY_PRIVATE_TOKEN=<at least 32 random characters, used only by Spring's private WebSocket>
 CXBA_CASE_STORAGE_ROOT=<absolute host path outside the Sandbox>
+CXBA_KNOWLEDGE_VAULT_ROOT=<absolute shared Obsidian Vault host path>
 CXBA_SPRING_MCP_URL=<Spring MCP endpoint>
 CXBA_SPRING_MCP_TOKEN=<Spring MCP bearer token>
 ```

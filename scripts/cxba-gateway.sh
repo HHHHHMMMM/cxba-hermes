@@ -48,6 +48,7 @@ init_config() {
 		printf 'export CXBA_LOCAL_MODEL_BASE_URL=%q\n' "${CXBA_LOCAL_MODEL_BASE_URL:-https://llm-gz2xserodo4c3kj6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
 		printf 'export CXBA_BAILIAN_API_KEY=%q\n' "${CXBA_BAILIAN_API_KEY:-}"
 		printf 'export CXBA_CASE_STORAGE_ROOT=%q\n' "${case_storage_root}"
+		printf 'export CXBA_KNOWLEDGE_VAULT_ROOT=%q\n' "${CXBA_KNOWLEDGE_VAULT_ROOT:-$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/knowledge-vault}"
 		printf 'export CXBA_SPRING_MCP_URL=%q\n' "${CXBA_SPRING_MCP_URL:-http://127.0.0.1:${SPRING_PORT}/mcp}"
 		printf 'export CXBA_MCP_ENABLED=true\n'
 		printf 'export CXBA_HERMES_GATEWAY_URL=%q\n' "ws://127.0.0.1:${PORT}/api/ws"
@@ -72,7 +73,9 @@ is_cxba_gateway_process() {
 	local pid=$1
 	local command
 	command=$(process_command "${pid}")
-	[[ ( "${command}" == *"${HERMES_BIN}"* || "${command}" == *"${PROJECT_DIR}/.venv/bin/python ./.venv/bin/hermes"* ) \
+	[[ ( "${command}" == *"${HERMES_BIN}"* \
+		|| "${command}" == *"${PROJECT_DIR}/.venv/bin/python ./.venv/bin/hermes"* \
+		|| "${command}" == *"${PROJECT_DIR}/.venv/bin/python ${HERMES_BIN}"* ) \
 		&& "${command}" == *"serve"* && "${command}" == *"--port ${PORT}"* ]]
 }
 
@@ -104,6 +107,7 @@ inherit_gateway_environment() {
 		CXBA_BAILIAN_API_KEY \
 		CXBA_SILICONFLOW_API_KEY \
 		CXBA_CASE_STORAGE_ROOT \
+		CXBA_KNOWLEDGE_VAULT_ROOT \
 		CXBA_SPRING_MCP_URL
 	do
 		if [[ -z "${!key:-}" ]]; then
@@ -137,8 +141,9 @@ prepare_environment() {
 	: "${CXBA_LOCAL_MODEL:=qwen3.6-27b}"
 	: "${CXBA_LOCAL_MODEL_BASE_URL:=https://llm-gz2xserodo4c3kj6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
 	: "${CXBA_CASE_STORAGE_ROOT:=$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/data/cxba}"
+	: "${CXBA_KNOWLEDGE_VAULT_ROOT:=$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/knowledge-vault}"
 	: "${CXBA_SPRING_MCP_URL:=http://127.0.0.1:${SPRING_PORT}/mcp}"
-	export CXBA_LOCAL_MODEL CXBA_LOCAL_MODEL_BASE_URL CXBA_BAILIAN_API_KEY CXBA_SILICONFLOW_API_KEY CXBA_CASE_STORAGE_ROOT CXBA_SPRING_MCP_URL
+	export CXBA_LOCAL_MODEL CXBA_LOCAL_MODEL_BASE_URL CXBA_BAILIAN_API_KEY CXBA_SILICONFLOW_API_KEY CXBA_CASE_STORAGE_ROOT CXBA_KNOWLEDGE_VAULT_ROOT CXBA_SPRING_MCP_URL
 
 	local missing=()
 	[[ -n "${CXBA_GATEWAY_PRIVATE_TOKEN:-}" ]] || missing+=(CXBA_GATEWAY_PRIVATE_TOKEN)
@@ -222,7 +227,10 @@ start_gateway() {
 		echo "Stop it explicitly before starting Hermes Gateway." >&2
 		return 1
 	fi
-	gateway_command="set -a; source $(quote_shell "${ENV_FILE}"); set +a; exec $(quote_shell "${HERMES_BIN}") -p $(quote_shell "${PROFILE}") serve --host $(quote_shell "${HOST}") --port $(quote_shell "${PORT}") --isolated --skip-build >> $(quote_shell "${LOG_FILE}") 2>&1"
+	# tmux only forwards a small allow-list from the calling shell. Keep values
+	# loaded from the private file, then explicitly carry the non-secret defaults
+	# prepared above so older config files also receive newly required roots.
+	gateway_command="set -a; source $(quote_shell "${ENV_FILE}"); set +a; export CXBA_LOCAL_MODEL=$(quote_shell "${CXBA_LOCAL_MODEL}") CXBA_LOCAL_MODEL_BASE_URL=$(quote_shell "${CXBA_LOCAL_MODEL_BASE_URL}") CXBA_CASE_STORAGE_ROOT=$(quote_shell "${CXBA_CASE_STORAGE_ROOT}") CXBA_KNOWLEDGE_VAULT_ROOT=$(quote_shell "${CXBA_KNOWLEDGE_VAULT_ROOT}") CXBA_SPRING_MCP_URL=$(quote_shell "${CXBA_SPRING_MCP_URL}"); exec $(quote_shell "${HERMES_BIN}") -p $(quote_shell "${PROFILE}") serve --host $(quote_shell "${HOST}") --port $(quote_shell "${PORT}") --isolated --skip-build >> $(quote_shell "${LOG_FILE}") 2>&1"
 	tmux new-session -d -s "${TMUX_SESSION}" -c "${PROJECT_DIR}" "/bin/bash -lc $(quote_shell "${gateway_command}")"
 
 	local attempt

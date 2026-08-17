@@ -26,6 +26,7 @@ def _run(tmp_path: Path):
     case_context = {
         "case_basic": {"case_id": "case-1"},
         "global_master_links": [],
+        "investigation_mode": "STANDARD",
         "material_catalog": [
             {"materialId": "material-1", "relativePath": "流水.xlsx"}
         ],

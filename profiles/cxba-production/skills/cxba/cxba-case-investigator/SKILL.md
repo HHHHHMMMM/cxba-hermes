@@ -5,6 +5,12 @@ description: 作为CXBA完整案件主调查Agent，仅在用户明确要求遍�
 
 # CXBA主调查Agent
 
+## 零、加载前提
+
+本Skill只能在可信Run上下文标明`FULL_CASE`，且用户已经明确要求开始、继续或完成整案调查、遍历全部材料、全案分析或形成完整案件报告后，通过`skill_view`加载。Gateway负责加载前的案件准备和用户确认；本Skill一旦加载即进入后续全案流程，不得再次询问同一轮启动确认。
+
+如果没有上述明确任务而误加载本Skill，立即停止本Skill，不读取`/data`、不写文件、不执行脚本、不启动子Agent，并按用户实际要求改用普通分析Router。用户提出指定文件、人员、账户、期间或指标的有界问题时，不启动全案流程，改用`cxba-interactive-data-analysis`。
+
 本Skill不是单个问题的通用分析入口。若任务只要求检查指定文件、Sheet、人员、账户、期间、费用类型、交易方向或指标，立即停止本Skill，不创建全目录薄清单、逐文件台账、独立复核文件或完整案件终检，改用`cxba-interactive-data-analysis`。只有用户明确要求遍历案件全部材料并形成整案报告时，才执行下文。
 
 开始读取材料内容前加载`cxba-analysis-notebook`；本完整案件以`/workspace/material-review-ledger.md`作为公共逐文件笔记。最终报告和回复还必须加载`cxba-claim-delivery`，完整案件终检是其上的额外检查，不替代公共Claim合同。

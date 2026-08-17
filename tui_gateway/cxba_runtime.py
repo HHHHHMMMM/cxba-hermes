@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 _CASE_CONTEXT_KEYS = frozenset(
-    {"case_basic", "global_master_links", "material_catalog"}
+    {"case_basic", "global_master_links", "investigation_mode", "material_catalog"}
 )
 _CASE_MEMORY_TARGET = "/case/Memory.md"
+_INVESTIGATION_MODES = frozenset({"STANDARD", "FULL_CASE"})
 
 
 def validate_session_binding(raw: Any) -> dict[str, Any]:
@@ -62,9 +63,14 @@ def validate_case_context(raw: Any) -> dict[str, Any]:
         raise ValueError("case_context.case_basic must be an object")
     if not isinstance(raw["global_master_links"], list):
         raise ValueError("case_context.global_master_links must be an array")
+    investigation_mode = str(raw["investigation_mode"] or "").strip()
+    if investigation_mode not in _INVESTIGATION_MODES:
+        raise ValueError("case_context.investigation_mode must be STANDARD or FULL_CASE")
     if not isinstance(raw["material_catalog"], list):
         raise ValueError("case_context.material_catalog must be an array")
-    return copy.deepcopy(raw)
+    current = copy.deepcopy(raw)
+    current["investigation_mode"] = investigation_mode
+    return current
 
 
 def validate_case_context_matches_binding(
@@ -126,7 +132,8 @@ def binding_system_context(binding: dict[str, Any] | None) -> str | None:
         "with the terminal before substantive analysis. Never edit it directly; propose "
         "a complete replacement with cxba_propose_case_memory_update for human approval. "
         "The control plane refreshes /workspace/input/materials.json at the start of "
-        "every Run. For any "
+        "every Run. Except when the trusted current-Run context explicitly directs "
+        "FULL_CASE activation, for any "
         "request to find, inspect, read, profile, analyze, investigate, reconcile, or "
         "review case materials or conclusions, first load and follow the "
         "cxba-analysis-router Skill with skill_view. Load only the specialist Skills "
@@ -149,17 +156,38 @@ def case_context_model_prompt(case_context: dict[str, Any] | None) -> str | None
     payload = {
         "case_basic": current["case_basic"],
         "global_master_links": current["global_master_links"],
+        "investigation_mode": current["investigation_mode"],
         "material_catalog": {
             "path": "/workspace/input/materials.json",
             "count": len(current["material_catalog"]),
             "authority": "Gateway trusted Run context",
         },
     }
-    return (
+    prompt = (
         "CXBA current Run context follows. It was refreshed by the control plane for "
         "this Run. The Gateway-held catalog is authoritative for evidence validation; "
         "/workspace/input/materials.json is the model-readable copy.\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    if current["investigation_mode"] != "FULL_CASE":
+        return prompt
+    return prompt + (
+        "\nCXBA trusted FULL_CASE mode protocol: mode selection does not preload or "
+        "activate a Skill. If the current conversation shows that full-case "
+        "investigation already started, continue from its existing guidance and "
+        "progress without repeating readiness. If the latest user request explicitly "
+        "asks to start, continue or complete the full-case investigation, first call "
+        "skill_view for cxba-case-investigator and then proceed without asking for the "
+        "same confirmation again. If the user asks a bounded question about a specific "
+        "file, person, account, period or metric, follow the normal analysis Router "
+        "without activating full-case investigation. Otherwise perform readiness only: "
+        "read /case/Memory.md as required by the separate trusted memory notice, read "
+        "/workspace/input/materials.json only for registered material names, types and "
+        "counts, and read /workspace/investigation-state.md only if it exists. Then "
+        "briefly explain the case focus, material overview and existing progress in "
+        "Chinese and ask whether to start the full-case investigation. Before explicit "
+        "confirmation, do not load cxba-case-investigator or other analysis Skills, "
+        "open /data material contents, write files, run analysis scripts, or delegate."
     )
 
 
@@ -563,7 +591,7 @@ def poll_run_heartbeat(run_id: str) -> tuple[dict[str, Any], bool, str | None]:
 
 
 def monitor_run_heartbeat_once(run_id: str) -> tuple[bool, str | None]:
-    """Probe once and surface probe failures as an unhealthy transition."""
+    """Probe once without turning probe errors into business Run failures."""
     with _lock:
         record = _runs.get(run_id)
         if record is None:
@@ -577,10 +605,7 @@ def monitor_run_heartbeat_once(run_id: str) -> tuple[bool, str | None]:
             run_id,
             type(exc).__name__,
         )
-        levels = {
-            "probe": {"status": "failed", "error_type": type(exc).__name__}
-        }
-        changed, event_type = record_heartbeat(run_id, healthy=False)
+        return False, None
     if changed and event_type:
         from tui_gateway import server
 
@@ -662,6 +687,11 @@ def detach_completed_run(run_id: str, status: str = "COMPLETED") -> None:
     with _lock:
         record = _runs.get(run_id)
         if record is None:
+            return
+        # A confirmed heartbeat failure is terminal. A late model/tool
+        # completion must not revive the old Run after Spring has already
+        # released the Session for a new Run.
+        if record.status == "FAILED" and status != "FAILED":
             return
         record.sandbox_registered = False
         record.status = status
@@ -985,12 +1015,11 @@ def record_heartbeat(run_id: str, *, healthy: bool) -> tuple[bool, str | None]:
         if record is None:
             raise KeyError(run_id)
         record.last_heartbeat_at = time.time()
-        if healthy and record.heartbeat_lost:
-            record.heartbeat_lost = False
-            return True, "heartbeat.recovered"
+        if healthy:
+            return False, None
         if not healthy and not record.heartbeat_lost:
             record.heartbeat_lost = True
-            record.status = "UNREACHABLE"
+            record.status = "FAILED"
             return True, "heartbeat.lost"
         return False, None
 

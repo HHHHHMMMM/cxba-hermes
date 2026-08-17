@@ -48,6 +48,7 @@ def _case_context(material_catalog=None) -> dict:
     return {
         "case_basic": {"case_id": "case-1", "name": "测试案件"},
         "global_master_links": [{"type": "ACCOUNT", "id": "account-1"}],
+        "investigation_mode": "STANDARD",
         "material_catalog": list(
             material_catalog
             if material_catalog is not None
@@ -95,8 +96,22 @@ def test_session_binding_is_stable_and_run_context_is_dynamic() -> None:
         "business_branch_id",
     }
     assert "测试案件" in run_prompt
+    assert '"investigation_mode":"STANDARD"' in run_prompt
     assert '"count":1' in run_prompt
     assert "material-1" not in run_prompt
+
+
+def test_full_case_mode_is_a_short_trusted_protocol_not_an_eager_skill_body() -> None:
+    context = _case_context()
+    context["investigation_mode"] = "FULL_CASE"
+
+    run_prompt = case_context_model_prompt(validate_case_context(context))
+
+    assert '"investigation_mode":"FULL_CASE"' in run_prompt
+    assert "skill_view for cxba-case-investigator" in run_prompt
+    assert "does not preload or activate a Skill" in run_prompt
+    assert "The full skill content is loaded below" not in run_prompt
+    assert "# CXBA主调查Agent" not in run_prompt
 
 
 def test_case_memory_reloads_on_first_run_change_and_session_key_rotation(
@@ -200,6 +215,11 @@ def test_session_binding_rejects_unexpected_business_fields() -> None:
 def test_run_context_rejects_extra_business_sections() -> None:
     with pytest.raises(ValueError, match="case_context"):
         validate_case_context({**_case_context(), "confirmed_findings": []})
+
+
+def test_run_context_rejects_unknown_investigation_mode() -> None:
+    with pytest.raises(ValueError, match="investigation_mode"):
+        validate_case_context({**_case_context(), "investigation_mode": "UNKNOWN"})
 
 
 def test_run_must_match_case_session_and_branch_binding(tmp_path: Path) -> None:
@@ -898,7 +918,7 @@ def test_failed_approval_delivery_attempt_is_removed_before_explicit_retry(
     assert drain_approval_events(run.run_id) == [retried]
 
 
-def test_heartbeat_probe_exception_emits_lost_then_real_probe_emits_recovered(
+def test_heartbeat_probe_exception_keeps_the_last_run_state(
     tmp_path: Path, monkeypatch
 ) -> None:
     from tui_gateway import cxba_runtime, server
@@ -917,8 +937,9 @@ def test_heartbeat_probe_exception_emits_lost_then_real_probe_emits_recovered(
         lambda _run_id: (_ for _ in ()).throw(RuntimeError("probe failed")),
     )
 
-    assert monitor_run_heartbeat_once("run-1") == (True, "heartbeat.lost")
-    assert emitted == ["heartbeat.lost"]
+    assert monitor_run_heartbeat_once("run-1") == (False, None)
+    assert emitted == []
+    assert cxba_runtime.get_run("run-1").status == "RUNNING"
 
     monkeypatch.setattr(
         cxba_runtime,
@@ -928,11 +949,12 @@ def test_heartbeat_probe_exception_emits_lost_then_real_probe_emits_recovered(
             *cxba_runtime.record_heartbeat("run-1", healthy=True),
         ),
     )
-    assert monitor_run_heartbeat_once("run-1") == (True, "heartbeat.recovered")
-    assert emitted == ["heartbeat.lost", "heartbeat.recovered"]
+    assert monitor_run_heartbeat_once("run-1") == (False, None)
+    assert emitted == []
+    assert cxba_runtime.get_run("run-1").status == "RUNNING"
 
 
-def test_active_tool_heartbeat_loss_and_recovery_changes_run_health(
+def test_active_tool_heartbeat_loss_fails_run_and_cannot_recover(
     tmp_path: Path, monkeypatch
 ) -> None:
     from tui_gateway import cxba_runtime
@@ -955,10 +977,12 @@ def test_active_tool_heartbeat_loss_and_recovery_changes_run_health(
 
     _levels, changed, event_type = cxba_runtime.poll_run_heartbeat(run.run_id)
     assert (changed, event_type) == (True, "heartbeat.lost")
+    assert cxba_runtime.get_run(run.run_id).status == "FAILED"
 
     levels["tool"] = {"active": True, "alive": True, "observed_at": 2.0}
     _levels, changed, event_type = cxba_runtime.poll_run_heartbeat(run.run_id)
-    assert (changed, event_type) == (True, "heartbeat.recovered")
+    assert (changed, event_type) == (False, None)
+    assert cxba_runtime.get_run(run.run_id).status == "FAILED"
 
     levels["tool"] = {"active": False, "alive": False, "observed_at": 3.0}
     _levels, changed, event_type = cxba_runtime.poll_run_heartbeat(run.run_id)

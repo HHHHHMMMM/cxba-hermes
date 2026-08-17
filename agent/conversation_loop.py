@@ -1360,6 +1360,60 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _usage_updated_payload(agent: Any) -> Dict[str, Any]:
+    """Build one non-sensitive cumulative usage snapshot for live UI events."""
+    usage: Dict[str, Any] = {
+        "model": getattr(agent, "model", "") or "",
+        "input": getattr(agent, "session_input_tokens", 0) or 0,
+        "output": getattr(agent, "session_output_tokens", 0) or 0,
+        "reasoning": getattr(agent, "session_reasoning_tokens", 0) or 0,
+        "prompt": getattr(agent, "session_prompt_tokens", 0) or 0,
+        "completion": getattr(agent, "session_completion_tokens", 0) or 0,
+        "total": getattr(agent, "session_total_tokens", 0) or 0,
+        "calls": getattr(agent, "session_api_calls", 0) or 0,
+        "cache_read": getattr(agent, "session_cache_read_tokens", 0) or 0,
+        "cache_write": getattr(agent, "session_cache_write_tokens", 0) or 0,
+    }
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return usage
+    context_used = getattr(compressor, "last_prompt_tokens", 0) or 0
+    context_max = getattr(compressor, "context_length", 0) or 0
+    if context_used > 0 and context_max > 0:
+        usage.update({
+            "context_used": context_used,
+            "context_max": context_max,
+            "context_percent": max(0, min(100, round(context_used / context_max * 100))),
+        })
+    usage["compressions"] = getattr(compressor, "compression_count", 0) or 0
+    return usage
+
+
+def _emit_usage_updated(agent: Any) -> None:
+    """Publish live token counters without allowing observability to fail a turn."""
+    callback = getattr(agent, "event_callback", None)
+    if not callable(callback):
+        return
+    try:
+        callback("usage.updated", _usage_updated_payload(agent))
+    except Exception:
+        logger.debug("event_callback error on usage.updated", exc_info=True)
+
+
+def _record_response_usage(agent: Any, usage: Any) -> None:
+    """Accumulate one provider response and immediately publish the new totals."""
+    agent.session_prompt_tokens += usage.prompt_tokens
+    agent.session_completion_tokens += usage.output_tokens
+    agent.session_total_tokens += usage.total_tokens
+    agent.session_api_calls += 1
+    agent.session_input_tokens += usage.input_tokens
+    agent.session_output_tokens += usage.output_tokens
+    agent.session_cache_read_tokens += usage.cache_read_tokens
+    agent.session_cache_write_tokens += usage.cache_write_tokens
+    agent.session_reasoning_tokens += usage.reasoning_tokens
+    _emit_usage_updated(agent)
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -3489,15 +3543,7 @@ def run_conversation(
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
 
-                    agent.session_prompt_tokens += prompt_tokens
-                    agent.session_completion_tokens += completion_tokens
-                    agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
-                    agent.session_input_tokens += canonical_usage.input_tokens
-                    agent.session_output_tokens += canonical_usage.output_tokens
-                    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-                    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-                    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    _record_response_usage(agent, canonical_usage)
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

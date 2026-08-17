@@ -122,6 +122,7 @@ def test_local_qwen_real_gateway_controls_and_new_run_recovery(tmp_path, monkeyp
     case_context = {
         "case_basic": {"case_id": case_id, "case_name": "本地Qwen控制测试"},
         "global_master_links": [],
+        "investigation_mode": "STANDARD",
         "material_catalog": [],
     }
 

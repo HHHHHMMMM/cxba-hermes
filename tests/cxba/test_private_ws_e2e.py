@@ -19,6 +19,7 @@ def _case_context():
     return {
         "case_basic": {"case_id": "case-1", "case_name": "synthetic-case"},
         "global_master_links": [],
+        "investigation_mode": "STANDARD",
         "material_catalog": [],
     }
 

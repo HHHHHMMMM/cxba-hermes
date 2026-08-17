@@ -557,7 +557,9 @@ def _(rid, params: dict) -> dict:
         # (resume_session_id keeps the upgrade on the stored conversation).
         if is_truthy_value(params.get("lazy", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = _resolve_session_source(
+                str(params.get("source") or found.get("source") or "").strip() or None
+            )
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
                 db.reopen_session(target)
@@ -638,7 +640,9 @@ def _(rid, params: dict) -> dict:
         # session's persisted runtime identity, and is a real (upgradable) session.
         if not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = _resolve_session_source(
+                str(params.get("source") or found.get("source") or "").strip() or None
+            )
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             # Interactive resume routes approvals/clarify through gateway prompts;
             # the deferred build wires the remaining per-session callbacks.
@@ -666,10 +670,10 @@ def _(rid, params: dict) -> dict:
             # not replay the unanswered call forever (#29086).
             prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
             history = sanitize_replay_history(raw_history)
-            # Restore the model/provider/reasoning/tier this chat last used so the
-            # deferred build (and the info below) match the eager path — without them
-            # the build drops the provider ("No LLM provider configured").
-            overrides = _stored_session_runtime_overrides(found) or {}
+            # Ordinary chats restore their stored runtime; trusted CXBA chats
+            # deliberately build from the current deployment route. Both the
+            # deferred and eager paths use the same selector.
+            overrides = _resume_runtime_overrides(found, stored_cxba_binding) or {}
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
@@ -727,7 +731,9 @@ def _(rid, params: dict) -> dict:
         # _session_resume_lock across it would stall session.close on the main
         # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
         sid = uuid.uuid4().hex[:8]
-        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        source = _resolve_session_source(
+            str(params.get("source") or found.get("source") or "").strip() or None
+        )
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         _enable_gateway_prompts()
         home_token = (
@@ -768,10 +774,11 @@ def _(rid, params: dict) -> dict:
             try:
                 # Pass the profile's db so the agent persists turns to the right
                 # state.db; home override is active here so config/skills/model
-                # resolve to the profile too. Runtime identity is restored from the
-                # stored session row so switching chats does not inherit whatever
-                # global model another chat last selected.
-                stored_runtime_overrides = _stored_session_runtime_overrides(found)
+                # resolve to the profile too. Ordinary chats restore their stored
+                # runtime identity; trusted CXBA chats follow the current deployment.
+                stored_runtime_overrides = _resume_runtime_overrides(
+                    found, stored_cxba_binding
+                )
                 agent = _make_agent(
                     sid,
                     target,
@@ -3466,7 +3473,7 @@ def _(rid, params: dict) -> dict:
             _emit(event_type, run.runtime_session_id, {"levels": levels})
         return _ok(
             rid,
-            {"run_id": run_id, "status": "RUNNING" if healthy else "UNREACHABLE", **levels},
+            {"run_id": run_id, "status": "RUNNING" if healthy else "FAILED", **levels},
         )
     except (OSError, ValueError) as exc:
         return _err(rid, 5000, f"heartbeat probe failed: {exc}")
@@ -4130,6 +4137,299 @@ def _(rid, params: dict) -> dict:
             "text": text,
         },
     )
+
+
+@method("session.queue.snapshot")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if session.get("cxba_binding") is None:
+        return _err(rid, 4037, "prompt queue requires a CXBA session")
+    sid = str(params.get("session_id") or "")
+    snapshot = _cxba_prompt_queue_snapshot(session)
+    if not session.get("running"):
+        from tui_gateway.cxba_runtime import run_for_session
+
+        if run_for_session(sid) is None:
+            _request_cxba_prompt_claim(sid, session)
+        snapshot = _cxba_prompt_queue_snapshot(session)
+    return _ok(rid, snapshot)
+
+
+@method("session.queue.enqueue")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if session.get("cxba_binding") is None:
+        return _err(rid, 4037, "prompt queue requires a CXBA session")
+    text = str(params.get("text") or "").strip()
+    prompt = str(params.get("prompt") or "").strip()
+    actor_user_id = str(params.get("actor_user_id") or "").strip()
+    if not text or not prompt or not actor_user_id:
+        return _err(rid, 4002, "text, prompt and actor_user_id are required")
+    sid = str(params.get("session_id") or "")
+    from tui_gateway.cxba_runtime import run_for_session
+
+    active_run = run_for_session(sid)
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if not session.get("running") and active_run is None:
+            return _err(rid, 4095, "Session is idle; submit a new Run instead")
+        item = {
+            "message_id": uuid.uuid4().hex,
+            "text": text,
+            "prompt": prompt,
+            "attachments": list(params.get("attachments") or []),
+            "actor_user_id": actor_user_id,
+            "created_at": time.time(),
+            "reasoning_enabled": bool(params.get("reasoning_enabled")),
+        }
+        inbox.append(item)
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        with session["history_lock"]:
+            inbox[:] = [queued for queued in inbox if queued.get("message_id") != item["message_id"]]
+        return _err(rid, 5008, f"failed to persist prompt queue: {exc}")
+    snapshot = _emit_cxba_prompt_queue(str(params.get("session_id") or ""), session)
+    return _ok(rid, {"item": _public_cxba_prompt_item(item), **snapshot})
+
+
+@method("session.queue.update")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    message_id = str(params.get("message_id") or "").strip()
+    text = str(params.get("text") or "").strip()
+    prompt = str(params.get("prompt") or "").strip()
+    if not message_id or not text or not prompt:
+        return _err(rid, 4002, "message_id, text and prompt are required")
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if session.get("_cxba_prompt_claim_pending") == message_id:
+            return _err(rid, 4096, "prompt is being claimed")
+        item = next((queued for queued in inbox if queued.get("message_id") == message_id), None)
+        if item is None:
+            return _err(rid, 4007, "queued prompt not found")
+        item["text"] = text
+        item["prompt"] = prompt
+        item["attachments"] = list(params.get("attachments") or [])
+        item["reasoning_enabled"] = bool(params.get("reasoning_enabled"))
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        return _err(rid, 5008, f"failed to persist prompt queue: {exc}")
+    return _ok(rid, _emit_cxba_prompt_queue(str(params.get("session_id") or ""), session))
+
+
+@method("session.queue.delete")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    message_id = str(params.get("message_id") or "").strip()
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if session.get("_cxba_prompt_claim_pending") == message_id:
+            return _err(rid, 4096, "prompt is being claimed")
+        original_size = len(inbox)
+        inbox[:] = [item for item in inbox if item.get("message_id") != message_id]
+        if len(inbox) == original_size:
+            return _err(rid, 4007, "queued prompt not found")
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        return _err(rid, 5008, f"failed to persist prompt queue: {exc}")
+    return _ok(rid, _emit_cxba_prompt_queue(str(params.get("session_id") or ""), session))
+
+
+@method("session.queue.steer")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    message_id = str(params.get("message_id") or "").strip()
+    if "case_context" not in params:
+        return _err(rid, 4039, "queued steer requires a trusted case_context")
+    from tui_gateway.cxba_runtime import case_context_model_prompt, run_for_session, update_run_case_context
+
+    run = run_for_session(sid)
+    if run is None:
+        return _err(rid, 4094, "CXBA Run is terminal or detached")
+    try:
+        run = update_run_case_context(sid, session.get("cxba_binding"), params.get("case_context"))
+    except ValueError as exc:
+        return _err(rid, 4039, f"invalid trusted case_context: {exc}")
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if session.get("_cxba_prompt_claim_pending") == message_id:
+            return _err(rid, 4096, "prompt is being claimed")
+        item = next((queued for queued in inbox if queued.get("message_id") == message_id), None)
+        if item is None:
+            return _err(rid, 4007, "queued prompt not found")
+        prompt = str(item.get("prompt") or item.get("text") or "").strip()
+    model_text = prompt
+    if current_case_note := case_context_model_prompt(run.case_context):
+        model_text = f"{current_case_note}\n\n{prompt}"
+    if session.get("running"):
+        agent = session.get("agent")
+        try:
+            accepted = bool(agent is not None and hasattr(agent, "steer") and agent.steer(model_text))
+        except Exception as exc:
+            return _err(rid, 5000, f"steer failed: {exc}")
+        if not accepted:
+            return _err(rid, 4097, "agent did not accept steer")
+    else:
+        with session["history_lock"]:
+            if session.get("running"):
+                return _err(rid, 4009, "session busy")
+            session["running"] = True
+        if not _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            model_text,
+            display_kind="cxba_read_only_continuation",
+            trusted_run_context=run.context,
+            trusted_case_context=run.case_context,
+        ):
+            with session["history_lock"]:
+                session["running"] = False
+            return _err(rid, 5031, "queued steer continuation could not start")
+    with session["history_lock"]:
+        inbox[:] = [queued for queued in inbox if queued.get("message_id") != message_id]
+        if session.get("inflight_turn"):
+            _record_inflight_correction(session, prompt)
+        session["last_active"] = time.time()
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        return _err(rid, 5008, f"steer accepted but queue persistence failed: {exc}")
+    _emit("steer.received", sid, {"status": "QUEUED", "queue_message_id": message_id})
+    return _ok(rid, {"status": "steered", "control_outcome": "accepted", **_emit_cxba_prompt_queue(sid, session)})
+
+
+@method("session.queue.claim")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    message_id = str(params.get("message_id") or "").strip()
+    trusted_prompt = str(params.get("prompt") or "").strip()
+    if not trusted_prompt:
+        return _err(rid, 4002, "trusted prompt is required")
+    try:
+        from tools.run_sandbox import validate_run_context
+        from tui_gateway.cxba_runtime import (
+            validate_case_context,
+            validate_case_context_matches_binding,
+            validate_run_matches_binding,
+        )
+
+        trusted_run_context = validate_run_context(params.get("run_context"))
+        trusted_case_context = validate_case_context(params.get("case_context"))
+        validate_run_matches_binding(session.get("cxba_binding"), trusted_run_context)
+        validate_case_context_matches_binding(session.get("cxba_binding"), trusted_case_context)
+    except (OSError, ValueError) as exc:
+        return _err(rid, 4039, f"invalid trusted queue claim context: {exc}")
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+        if not inbox or inbox[0].get("message_id") != message_id:
+            return _err(rid, 4096, "only the first queued prompt can be claimed")
+        if session.get("_cxba_prompt_claim_pending") not in (None, "", message_id):
+            return _err(rid, 4096, "another prompt is being claimed")
+        item = dict(inbox[0])
+        session["running"] = True
+        session["_turn_cancel_requested"] = False
+        session["_safe_stop_requested"] = False
+        session["_cxba_prompt_claim_pending"] = message_id
+    started = _run_prompt_submit(
+        rid,
+        sid,
+        session,
+        trusted_prompt,
+        trusted_run_context=trusted_run_context,
+        trusted_case_context=trusted_case_context,
+    )
+    if not started:
+        with session["history_lock"]:
+            session["running"] = False
+            session.pop("_cxba_prompt_claim_pending", None)
+        return _err(rid, 5031, "queued prompt could not start")
+    with session["history_lock"]:
+        if inbox and inbox[0].get("message_id") == message_id:
+            inbox.pop(0)
+        session.pop("_cxba_prompt_claim_pending", None)
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        return _err(rid, 5008, f"queued prompt started but queue persistence failed: {exc}")
+    return _ok(rid, {"status": "streaming", "message_id": message_id, **_emit_cxba_prompt_queue(sid, session)})
+
+
+@method("session.queue.reject")
+def _(rid, params: dict) -> dict:
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    message_id = str(params.get("message_id") or "").strip()
+    reason = str(params.get("reason") or "queued prompt rejected").strip()
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if not inbox or inbox[0].get("message_id") != message_id:
+            return _err(rid, 4096, "only the first queued prompt can be rejected")
+        rejected = inbox.pop(0)
+        session.pop("_cxba_prompt_claim_pending", None)
+    try:
+        _persist_cxba_prompt_inbox(session)
+    except Exception as exc:
+        return _err(rid, 5008, f"failed to persist prompt queue: {exc}")
+    write_json(_event_frame("session.queue.rejected", sid, {"item": _public_cxba_prompt_item(rejected), "reason": reason}))
+    snapshot = _emit_cxba_prompt_queue(sid, session)
+    _request_cxba_prompt_claim(sid, session)
+    return _ok(rid, snapshot)
+
+
+@method("session.queue.release")
+def _(rid, params: dict) -> dict:
+    """Release a failed control-plane claim without dropping the prompt."""
+    if err := _require_cxba_private(rid):
+        return err
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = str(params.get("session_id") or "")
+    message_id = str(params.get("message_id") or "").strip()
+    inbox = _cxba_prompt_inbox(session)
+    with session["history_lock"]:
+        if not inbox or inbox[0].get("message_id") != message_id:
+            return _err(rid, 4096, "only the first queued prompt can be released")
+        if session.get("_cxba_prompt_claim_pending") != message_id:
+            return _err(rid, 4096, "queued prompt is not being claimed")
+        session.pop("_cxba_prompt_claim_pending", None)
+    return _ok(rid, _emit_cxba_prompt_queue(sid, session))
 
 
 @method("session.redirect")

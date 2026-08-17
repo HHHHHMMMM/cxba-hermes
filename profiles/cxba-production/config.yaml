@@ -37,6 +37,7 @@ terminal:
   container_persistent: false
 
 agent:
+  coding_context: off
   disabled_toolsets:
     - memory
     - session_search

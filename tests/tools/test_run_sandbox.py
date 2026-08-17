@@ -6,6 +6,7 @@ import pytest
 import tools.run_sandbox as run_sandbox
 from tools.run_sandbox import (
     _configured_storage_root,
+    RunMount,
     bind_run_sandbox,
     current_run_sandbox_id,
     destroy_run_sandbox,
@@ -62,6 +63,31 @@ def test_validate_run_context_accepts_exact_mount_policy(tmp_path):
         "/data", "/workspace", "/case-sessions/session-1", "/exchange/current",
         "/shared", "/case/Memory.md"
     }
+
+
+def test_validate_run_context_accepts_only_configured_read_only_knowledge_vault(
+    tmp_path, monkeypatch
+):
+    raw = _context(tmp_path)
+    knowledge_root = tmp_path.parent / f"{tmp_path.name}-knowledge"
+    knowledge_root.mkdir()
+    monkeypatch.setenv("CXBA_KNOWLEDGE_VAULT_ROOT", str(knowledge_root))
+    raw["mounts"].append({
+        "source": str(knowledge_root),
+        "target": "/knowledge",
+        "read_only": True,
+    })
+
+    context = validate_run_context(raw, storage_root=tmp_path)
+    assert next(mount for mount in context.mounts if mount.target == "/knowledge") == RunMount(
+        str(knowledge_root), "/knowledge", True
+    )
+
+    wrong_root = tmp_path.parent / f"{tmp_path.name}-wrong-knowledge"
+    wrong_root.mkdir()
+    raw["mounts"][-1]["source"] = str(wrong_root)
+    with pytest.raises(ValueError, match="configured knowledge Vault root"):
+        validate_run_context(raw, storage_root=tmp_path)
 
 
 def test_validate_run_context_rejects_case_memory_from_another_path(tmp_path):

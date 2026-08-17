@@ -21,6 +21,7 @@ def _case_context(*, case_id="case-1", material_catalog=None):
     return {
         "case_basic": {"case_id": case_id, "case_name": "测试案件"},
         "global_master_links": [],
+        "investigation_mode": "STANDARD",
         "material_catalog": list(material_catalog or []),
     }
 
@@ -131,7 +132,7 @@ def test_private_create_persists_binding_and_resume_rejects_cross_case(
             {
                 "id": "create-1",
                 "method": "session.create",
-                "params": {"cxba_context": _context(), "source": "api_server"},
+                "params": {"cxba_context": _context(), "source": "cxba-workbench"},
             }
         )
         sid = created["result"]["session_id"]
@@ -180,7 +181,7 @@ def test_private_empty_create_survives_close_and_resumes_by_stable_id(
             {
                 "id": "create-empty",
                 "method": "session.create",
-                "params": {"cxba_context": _context(), "source": "api_server"},
+                "params": {"cxba_context": _context(), "source": "cxba-workbench"},
             }
         )
         runtime_sid = created["result"]["session_id"]
@@ -212,10 +213,92 @@ def test_private_empty_create_survives_close_and_resumes_by_stable_id(
         assert resumed["result"]["session_key"] == stored_sid
         assert resumed["result"]["messages"] == []
         resumed_sid = resumed["result"]["session_id"]
+        assert server._sessions[resumed_sid]["source"] == "cxba-workbench"
     finally:
         reset_transport(token)
         if resumed_sid:
             server._sessions.pop(resumed_sid, None)
+        db.close()
+
+
+def test_private_cxba_resume_uses_current_runtime_instead_of_stored_route(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    binding = _context()
+    db.create_session(
+        "stored-stale-route",
+        source="api_server",
+        model="old-model",
+        model_config={
+            "_cxba_binding": binding,
+            "model": "old-model",
+            "provider": "custom:old-endpoint",
+            "base_url": "http://127.0.0.1:18080/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    captured = {}
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+
+    def make_current_agent(_sid, _key, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(model="current-model", provider="custom")
+
+    def init_session(sid, key, agent, history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "created_at": 1.0,
+            "running": False,
+        }
+
+    monkeypatch.setattr(server, "_make_agent", make_current_agent)
+    monkeypatch.setattr(server, "_init_session", init_session)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, _session=None: {"model": agent.model, "provider": agent.provider},
+    )
+    token = bind_transport(SimpleNamespace(cxba_private_authority=True))
+    runtime_sid = None
+    try:
+        resumed = server.handle_request(
+            {
+                "id": "resume-current-route",
+                "method": "session.resume",
+                "params": {
+                    "session_id": "stored-stale-route",
+                    "eager_build": True,
+                    "cxba_context": binding,
+                },
+            }
+        )
+
+        assert "error" not in resumed
+        runtime_sid = resumed["result"]["session_id"]
+        assert resumed["result"]["info"] == {
+            "model": "current-model",
+            "provider": "custom",
+        }
+        for stale_override in (
+            "model_override",
+            "provider_override",
+            "reasoning_config_override",
+            "service_tier_override",
+        ):
+            assert stale_override not in captured
+        assert server._sessions[runtime_sid]["cxba_binding"] == binding
+    finally:
+        reset_transport(token)
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
         db.close()
 
 

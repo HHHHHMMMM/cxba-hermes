@@ -1,0 +1,1 @@
+../../../profiles/cxba-production/skills/cxba/cxba-investigation-knowledge/SKILL.md

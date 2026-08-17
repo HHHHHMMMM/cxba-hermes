@@ -68,6 +68,19 @@ def _configured_storage_root() -> Path:
     return root.resolve(strict=True)
 
 
+def _configured_knowledge_root() -> Path:
+    raw = os.getenv("CXBA_KNOWLEDGE_VAULT_ROOT", "").strip()
+    if not raw:
+        raise ValueError("CXBA knowledge Vault root is not configured")
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        raise ValueError("CXBA knowledge Vault root must be an absolute path")
+    resolved = root.resolve(strict=True)
+    if root.is_symlink() or not resolved.is_dir():
+        raise ValueError("CXBA knowledge Vault root must be a regular directory")
+    return resolved
+
+
 def _required_identity(raw: dict[str, Any], name: str, *, run_id: bool = False) -> str:
     value = raw.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -87,7 +100,8 @@ def _normalize_target(value: Any) -> str:
         raise ValueError("run_context mount target must not contain '..'")
     target = str(PurePosixPath(value))
     fixed_targets = {
-        "/data", "/workspace", "/exchange/current", "/shared", "/case/Memory.md"
+        "/data", "/workspace", "/exchange/current", "/shared",
+        "/case/Memory.md", "/knowledge"
     }
     parts = PurePosixPath(target).parts
     scoped_target = bool(
@@ -134,13 +148,21 @@ def validate_run_context(raw: Any, *, storage_root: Path | None = None) -> Trust
             raise ValueError(f"run_context.mounts[{index}].source must be absolute")
         if any(char in source_value for char in ("\n", "\r", ":")):
             raise ValueError(f"run_context.mounts[{index}].source contains an invalid character")
-        source = Path(source_value).resolve(strict=True)
-        try:
-            source.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(
-                f"run_context.mounts[{index}].source is outside the configured case storage root"
-            ) from exc
+        source_path = Path(source_value)
+        source = source_path.resolve(strict=True)
+        target = _normalize_target(item.get("target"))
+        if target == "/knowledge":
+            if source_path.is_symlink() or source != _configured_knowledge_root():
+                raise ValueError(
+                    "run_context /knowledge source must be the configured knowledge Vault root"
+                )
+        else:
+            try:
+                source.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"run_context.mounts[{index}].source is outside the configured case storage root"
+                ) from exc
         try:
             reserved_runtime_root.relative_to(source)
         except ValueError:
@@ -150,7 +172,6 @@ def validate_run_context(raw: Any, *, storage_root: Path | None = None) -> Trust
                 f"run_context.mounts[{index}].source would expose the reserved runtime directory"
             )
 
-        target = _normalize_target(item.get("target"))
         if target in targets:
             raise ValueError(f"run_context contains duplicate mount target: {target}")
         targets.add(target)

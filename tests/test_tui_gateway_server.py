@@ -1081,6 +1081,93 @@ def test_tui_non_interactive_tool_lifecycle_stays_hidden_when_tool_progress_off(
     assert events == []
 
 
+def test_cxba_tool_lifecycle_preserves_native_input_and_failure(monkeypatch):
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setattr(server, "_is_cxba_run_session", lambda _sid: True)
+    monkeypatch.setattr(
+        "agent.display._detect_tool_failure",
+        lambda _name, _result: (True, "process exited with code 1"),
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "cxba-tool-test",
+        {"tool_progress_mode": "off", "tool_started_at": {}, "edit_snapshots": {}},
+    )
+
+    args = {"code": "from pathlib import Path\nprint(Path('/data').exists())"}
+    server._on_tool_start("cxba-tool-test", "tool-code-1", "execute_code", args)
+    server._on_tool_complete("cxba-tool-test", "tool-code-1", "execute_code", args, "failed")
+
+    assert events[0][0] == "tool.start"
+    assert events[0][2]["name"] == "execute_code"
+    assert events[0][2]["args"] == args
+    assert events[1][0] == "tool.failed"
+    assert events[1][2]["result"] == "failed"
+    assert events[1][2]["failure"] == "process exited with code 1"
+
+
+def test_cxba_step_and_terminal_presentation_are_emitted(monkeypatch):
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setattr(server, "_is_cxba_run_session", lambda _sid: True)
+    monkeypatch.setattr(
+        "agent.display._detect_tool_failure",
+        lambda _name, _result: (False, None),
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "cxba-step-test",
+        {"tool_progress_mode": "all", "tool_started_at": {}, "edit_snapshots": {}},
+    )
+
+    callbacks = server._agent_cbs("cxba-step-test")
+    callbacks["step_callback"](2, [])
+    callbacks["reasoning_callback"]("先定位审批模块。")
+    callbacks["tool_gen_callback"]("terminal")
+    args = {
+        "command": "find src -name '*.java'",
+        "description": "查找审批模块全部 Java 文件",
+        "card": "read",
+        "workdir": "/workspace",
+    }
+    server._on_tool_start("cxba-step-test", "tool-terminal-1", "terminal", args)
+    server._on_tool_complete(
+        "cxba-step-test",
+        "tool-terminal-1",
+        "terminal",
+        args,
+        '{"output":"src/A.java","exit_code":0,"error":null}',
+    )
+
+    assert events[0] == ("step.start", "cxba-step-test", {"step_index": 2})
+    assert events[1] == (
+        "reasoning.delta",
+        "cxba-step-test",
+        {"text": "先定位审批模块。", "step_index": 2},
+    )
+    assert events[2] == (
+        "tool.generating",
+        "cxba-step-test",
+        {"name": "terminal", "provisional": True, "step_index": 2},
+    )
+    assert events[3][2]["step_index"] == 2
+    assert events[3][2]["presentation"] == {
+        "card": "terminal",
+        "title": "find src -name '*.java'",
+        "description": "查找审批模块全部 Java 文件",
+        "cwd": "/workspace",
+    }
+    assert events[4][2]["step_index"] == 2
+    assert events[4][2]["result"]["output"] == "src/A.java"
+    assert "output" not in events[4][2]["presentation"]
+    assert events[4][2]["presentation"]["exit_code"] == 0
+
+
 def test_dispatch_rejects_non_object_request():
     resp = server.dispatch([])
 
@@ -1562,6 +1649,7 @@ def test_prompt_submit_accepts_valid_run_context_from_private_transport(
                 "case_context": {
                     "case_basic": {"case_id": "case-1"},
                     "global_master_links": [],
+                    "investigation_mode": "STANDARD",
                     "material_catalog": [],
                 },
             },
@@ -2568,6 +2656,16 @@ def test_expand_skill_invocation_for_replay_round_trips_the_projection(
     assert "SPIN UP A WORKTREE" in expanded
     assert server._skill_scaffold_projection(expanded) == "/worktree-kickoff fix it"
 
+    multiline_expanded = server._expand_skill_invocation_for_replay(
+        "/worktree-kickoff\n\nfix it", "task-1"
+    )
+
+    assert "SPIN UP A WORKTREE" in multiline_expanded
+    assert (
+        server._skill_scaffold_projection(multiline_expanded)
+        == "/worktree-kickoff fix it"
+    )
+
 
 def test_expand_skill_invocation_for_replay_leaves_ordinary_text_alone(monkeypatch):
     import agent.skill_commands as skill_commands
@@ -2580,6 +2678,49 @@ def test_expand_skill_invocation_for_replay_leaves_ordinary_text_alone(monkeypat
     assert server._expand_skill_invocation_for_replay("just words", "t") == "just words"
     # A core slash command is not a skill — nothing to expand.
     assert server._expand_skill_invocation_for_replay("/status", "t") == "/status"
+
+
+def test_prompt_submit_expands_a_direct_native_skill_invocation(monkeypatch):
+    sid = "direct-skill-submit"
+    server._sessions[sid] = _session()
+    captured = {}
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_expand_skill_invocation_for_replay",
+        lambda text, _task_id: "EXPANDED SKILL BODY" if text.startswith("/case-skill") else text,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **_kwargs: captured.setdefault("prompt", args[3]),
+    )
+
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    try:
+        response = server.handle_request({
+            "id": "direct-skill",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "/case-skill 整理本次办案方法"},
+        })
+        assert response["result"]["status"] == "streaming"
+        assert captured["prompt"] == "EXPANDED SKILL BODY"
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_history_to_messages_types_a_legacy_auto_continue_row():
@@ -3240,6 +3381,23 @@ def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
     assert overrides["service_tier_override"] == ""
 
 
+def test_cxba_resume_keeps_history_but_does_not_restore_stale_model_route():
+    row = {
+        "model": "old-model",
+        "model_config": {
+            "provider": "custom:old-endpoint",
+            "base_url": "http://127.0.0.1:18080/v1",
+            "api_mode": "chat_completions",
+        },
+    }
+
+    assert server._resume_runtime_overrides(row, {"case_id": "case-1"}) == {}
+
+    ordinary = server._resume_runtime_overrides(row, None)
+    assert ordinary["model_override"]["model"] == "old-model"
+    assert ordinary["model_override"]["base_url"] == "http://127.0.0.1:18080/v1"
+
+
 def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
     updates = {}
 
@@ -3785,6 +3943,385 @@ def _session(agent=None, **extra):
         "tool_progress_mode": "all",
         **extra,
     }
+
+
+class _PromptQueueDb:
+    def __init__(self):
+        self.values = {}
+
+    def get_session_model_config_value(self, session_id, key, default=None):
+        return self.values.get((session_id, key), default)
+
+    def patch_session_model_config(self, session_id, patch):
+        for key, value in patch.items():
+            if value is None:
+                self.values.pop((session_id, key), None)
+            else:
+                self.values[(session_id, key)] = value
+
+
+def _bound_cxba_queue_session(agent=None, **extra):
+    return _session(
+        agent=agent,
+        cxba_binding={
+            "case_id": "case-1",
+            "business_session_id": "business-session-1",
+            "business_branch_id": "branch-1",
+            "initial_context": {
+                "case_basic": {},
+                "global_master_links": [],
+                "material_catalog": [],
+            },
+        },
+        **extra,
+    )
+
+
+def test_cxba_prompt_queue_keeps_messages_independent_and_editable(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-prompt-queue"
+    db = _PromptQueueDb()
+    writes = []
+    session = _bound_cxba_queue_session(running=True)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    authority = types.SimpleNamespace(
+        cxba_private_authority=True,
+        write=lambda payload: writes.append(payload) or True,
+    )
+    token = bind_transport(authority)
+    try:
+        first = server.handle_request({
+            "id": "enqueue-1",
+            "method": "session.queue.enqueue",
+            "params": {
+                "session_id": sid,
+                "text": "第一条",
+                "prompt": "第一条模型内容",
+                "actor_user_id": "user-1",
+            },
+        })
+        second = server.handle_request({
+            "id": "enqueue-2",
+            "method": "session.queue.enqueue",
+            "params": {
+                "session_id": sid,
+                "text": "第二条",
+                "prompt": "第二条模型内容",
+                "actor_user_id": "user-1",
+            },
+        })
+        first_id = first["result"]["item"]["message_id"]
+        second_id = second["result"]["item"]["message_id"]
+
+        assert first_id != second_id
+        assert [item["text"] for item in second["result"]["items"]] == ["第一条", "第二条"]
+
+        updated = server.handle_request({
+            "id": "update-1",
+            "method": "session.queue.update",
+            "params": {
+                "session_id": sid,
+                "message_id": first_id,
+                "text": "第一条已修改",
+                "prompt": "第一条模型内容已修改",
+            },
+        })
+        assert updated["result"]["items"][0]["message_id"] == first_id
+        assert updated["result"]["items"][0]["text"] == "第一条已修改"
+
+        deleted = server.handle_request({
+            "id": "delete-2",
+            "method": "session.queue.delete",
+            "params": {"session_id": sid, "message_id": second_id},
+        })
+        assert [item["message_id"] for item in deleted["result"]["items"]] == [first_id]
+        assert writes
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_cxba_prompt_queue_accepts_idle_agent_while_background_run_is_active(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-prompt-background"
+    db = _PromptQueueDb()
+    session = _bound_cxba_queue_session(running=False)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.run_for_session",
+        lambda _sid: types.SimpleNamespace(status="RUNNING"),
+    )
+    authority = types.SimpleNamespace(cxba_private_authority=True, write=lambda _payload: True)
+    token = bind_transport(authority)
+    try:
+        response = server.handle_request({
+            "id": "enqueue-background",
+            "method": "session.queue.enqueue",
+            "params": {
+                "session_id": sid,
+                "text": "后台工具结束后继续",
+                "prompt": "后台工具结束后继续",
+                "actor_user_id": "user-1",
+            },
+        })
+        assert response["result"]["items"][0]["text"] == "后台工具结束后继续"
+
+        snapshot = server.handle_request({
+            "id": "snapshot-background",
+            "method": "session.queue.snapshot",
+            "params": {"session_id": sid},
+        })
+        assert snapshot["result"]["pending_claim_message_id"] is None
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_cxba_prompt_queue_steer_removes_only_selected_item(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    class Agent:
+        def __init__(self):
+            self.received = []
+
+        def steer(self, text):
+            self.received.append(text)
+            return True
+
+    sid = "cxba-prompt-steer"
+    db = _PromptQueueDb()
+    agent = Agent()
+    session = _bound_cxba_queue_session(agent=agent, running=True)
+    session["_cxba_prompt_inbox"] = [
+        {
+            "message_id": "message-1",
+            "text": "稍后执行一",
+            "prompt": "稍后执行一",
+            "actor_user_id": "user-1",
+            "created_at": 1.0,
+        },
+        {
+            "message_id": "message-2",
+            "text": "立即纠正二",
+            "prompt": "立即纠正二",
+            "actor_user_id": "user-1",
+            "created_at": 2.0,
+        },
+    ]
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.run_for_session",
+        lambda _sid: types.SimpleNamespace(case_context={}),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.update_run_case_context",
+        lambda _sid, _binding, case_context: types.SimpleNamespace(case_context=case_context),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.case_context_model_prompt",
+        lambda _context: "",
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    authority = types.SimpleNamespace(cxba_private_authority=True, write=lambda _payload: True)
+    token = bind_transport(authority)
+    try:
+        response = server.handle_request({
+            "id": "steer-2",
+            "method": "session.queue.steer",
+            "params": {
+                "session_id": sid,
+                "message_id": "message-2",
+                "case_context": {"case_basic": {}},
+            },
+        })
+
+        assert response["result"]["status"] == "steered"
+        assert agent.received == ["立即纠正二"]
+        assert [item["message_id"] for item in response["result"]["items"]] == ["message-1"]
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_cxba_prompt_queue_steer_continues_idle_agent_on_active_run(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-prompt-background-steer"
+    db = _PromptQueueDb()
+    session = _bound_cxba_queue_session(running=False)
+    session["_cxba_prompt_inbox"] = [{
+        "message_id": "message-background",
+        "text": "立即调整",
+        "prompt": "立即调整模型内容",
+        "actor_user_id": "user-1",
+        "created_at": 1.0,
+    }]
+    server._sessions[sid] = session
+    run = types.SimpleNamespace(context=object(), case_context={})
+    captured = {}
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    monkeypatch.setattr("tui_gateway.cxba_runtime.run_for_session", lambda _sid: run)
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.update_run_case_context",
+        lambda _sid, _binding, _case_context: run,
+    )
+    monkeypatch.setattr("tui_gateway.cxba_runtime.case_context_model_prompt", lambda _context: "")
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: captured.update({"args": args, "kwargs": kwargs}) or True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    authority = types.SimpleNamespace(cxba_private_authority=True, write=lambda _payload: True)
+    token = bind_transport(authority)
+    try:
+        response = server.handle_request({
+            "id": "steer-background",
+            "method": "session.queue.steer",
+            "params": {
+                "session_id": sid,
+                "message_id": "message-background",
+                "case_context": {"case_basic": {}},
+            },
+        })
+        assert response["result"]["status"] == "steered"
+        assert captured["args"][3] == "立即调整模型内容"
+        assert captured["kwargs"]["trusted_run_context"] is run.context
+        assert response["result"]["items"] == []
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_cxba_prompt_queue_claims_fifo_head_only(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-prompt-claim"
+    db = _PromptQueueDb()
+    session = _bound_cxba_queue_session(running=False)
+    session["_cxba_prompt_inbox"] = [
+        {
+            "message_id": "message-1",
+            "text": "第一条",
+            "prompt": "第一条模型内容",
+            "actor_user_id": "user-1",
+            "created_at": 1.0,
+        },
+        {
+            "message_id": "message-2",
+            "text": "第二条",
+            "prompt": "第二条模型内容",
+            "actor_user_id": "user-1",
+            "created_at": 2.0,
+        },
+    ]
+    server._sessions[sid] = session
+    captured = {}
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    monkeypatch.setattr(
+        "tools.run_sandbox.validate_run_context",
+        lambda value: types.SimpleNamespace(run_id=value["run_id"]),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.validate_case_context",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.validate_run_matches_binding",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "tui_gateway.cxba_runtime.validate_case_context_matches_binding",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: captured.update({"args": args, "kwargs": kwargs}) or True,
+    )
+    authority = types.SimpleNamespace(cxba_private_authority=True, write=lambda _payload: True)
+    token = bind_transport(authority)
+    try:
+        out_of_order = server.handle_request({
+            "id": "claim-2",
+            "method": "session.queue.claim",
+            "params": {
+                "session_id": sid,
+                "message_id": "message-2",
+                "prompt": "第二条模型内容",
+                "run_context": {"run_id": "run-2"},
+                "case_context": {},
+            },
+        })
+        assert out_of_order["error"]["code"] == 4096
+
+        claimed = server.handle_request({
+            "id": "claim-1",
+            "method": "session.queue.claim",
+            "params": {
+                "session_id": sid,
+                "message_id": "message-1",
+                "prompt": "第一条经过Spring复核的模型内容",
+                "run_context": {"run_id": "run-1"},
+                "case_context": {},
+            },
+        })
+        assert claimed["result"]["status"] == "streaming"
+        assert captured["args"][3] == "第一条经过Spring复核的模型内容"
+        assert [item["message_id"] for item in claimed["result"]["items"]] == ["message-2"]
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
+
+
+def test_cxba_prompt_queue_release_keeps_fifo_item(monkeypatch):
+    import contextlib
+
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    sid = "cxba-prompt-release"
+    db = _PromptQueueDb()
+    session = _bound_cxba_queue_session(running=False)
+    session["_cxba_prompt_inbox"] = [{
+        "message_id": "message-1",
+        "text": "继续核查",
+        "prompt": "继续核查",
+        "actor_user_id": "user-1",
+        "created_at": 1.0,
+    }]
+    session["_cxba_prompt_claim_pending"] = "message-1"
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(db))
+    authority = types.SimpleNamespace(cxba_private_authority=True, write=lambda _payload: True)
+    token = bind_transport(authority)
+    try:
+        response = server.handle_request({
+            "id": "release-1",
+            "method": "session.queue.release",
+            "params": {"session_id": sid, "message_id": "message-1"},
+        })
+
+        assert response["result"]["pending_claim_message_id"] is None
+        assert [item["message_id"] for item in response["result"]["items"]] == ["message-1"]
+        assert session["_cxba_prompt_inbox"][0]["message_id"] == "message-1"
+    finally:
+        reset_transport(token)
+        server._sessions.pop(sid, None)
 
 
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
@@ -5077,6 +5614,103 @@ def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
         server._sessions.pop("sid-owner", None)
 
 
+def test_run_prompt_submit_applies_cxba_deployment_model_before_agent_call(
+    monkeypatch, tmp_path
+):
+    order = []
+
+    class _OrderAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            order.append("agent")
+            return super().run_conversation(prompt, **kwargs)
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_sync_cxba_agent_with_deployment_config",
+        lambda sid, session: order.append(("cxba-model", sid, session["session_key"])),
+    )
+    monkeypatch.setattr(
+        server,
+        "_sync_agent_model_with_config",
+        lambda *_args: pytest.fail("CXBA Run must not use the generic session model sync"),
+    )
+    session = _session(
+        session_key="stored-cxba-model-policy",
+        agent=_OrderAgent([]),
+        running=True,
+        cxba_binding={
+            "case_id": "case-1",
+            "business_session_id": "session-1",
+            "business_branch_id": "branch-1",
+        },
+    )
+    server._sessions["sid-cxba-model-policy"] = session
+    try:
+        server._run_prompt_submit(
+            "rid-cxba-model-policy",
+            "sid-cxba-model-policy",
+            session,
+            "inspect current deployment",
+        )
+
+        assert order == [
+            ("cxba-model", "sid-cxba-model-policy", "stored-cxba-model-policy"),
+            "agent",
+        ]
+    finally:
+        server._sessions.pop("sid-cxba-model-policy", None)
+
+
+def test_run_prompt_submit_stops_before_agent_when_cxba_model_resolution_fails(
+    monkeypatch, tmp_path
+):
+    emitted = []
+
+    class _NeverCalledAgent(_RecordingAgent):
+        def run_conversation(self, *_args, **_kwargs):
+            pytest.fail("old session model must not run after deployment resolution fails")
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_sync_cxba_agent_with_deployment_config",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("CXBA deployment model resolution failed")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+    session = _session(
+        session_key="stored-cxba-model-failure",
+        agent=_NeverCalledAgent([]),
+        running=True,
+        cxba_binding={
+            "case_id": "case-1",
+            "business_session_id": "session-1",
+            "business_branch_id": "branch-1",
+        },
+    )
+    server._sessions["sid-cxba-model-failure"] = session
+    try:
+        server._run_prompt_submit(
+            "rid-cxba-model-failure",
+            "sid-cxba-model-failure",
+            session,
+            "do not use stale endpoint",
+        )
+
+        terminal = [item for item in emitted if item[0] == "message.complete"]
+        assert len(terminal) == 1
+        assert terminal[0][2]["status"] == "error"
+        assert "deployment model resolution failed" in terminal[0][2]["error"]
+    finally:
+        server._sessions.pop("sid-cxba-model-failure", None)
+
+
 def test_run_prompt_submit_uses_run_task_key_and_destroys_sandbox(
     monkeypatch, tmp_path
 ):
@@ -5381,6 +6015,78 @@ def test_run_prompt_submit_keeps_background_only_run_sandbox(monkeypatch, tmp_pa
         server._sessions.pop("sid-background-only", None)
 
 
+def test_late_steer_continues_current_run_before_agent_inbox_claim(monkeypatch, tmp_path):
+    from tools import terminal_tool
+    from tools.run_sandbox import RunMount, TrustedRunContext, destroy_run_sandbox
+    from tui_gateway import cxba_runtime
+
+    class _LateSteerAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "base response",
+                "messages": [],
+                "pending_steer": "STEER_LATE",
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    drained = []
+    claimed = []
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda _rid, _sid, queued_session: drained.append(
+            dict(queued_session.get("queued_prompt") or {})
+        ) or True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_request_cxba_prompt_claim",
+        lambda *_args: claimed.append(True) or True,
+    )
+    context = TrustedRunContext(
+        case_id="case-late-steer",
+        business_session_id="business-session-late-steer",
+        business_branch_id="branch-late-steer",
+        run_id="run-late-steer",
+        actor_user_id="user-late-steer",
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-late-steer"),
+        ),
+    )
+    session = _session(
+        session_key="stored-late-steer",
+        agent=_LateSteerAgent([]),
+        running=True,
+    )
+    server._sessions["sid-late-steer"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid-late-steer",
+            "sid-late-steer",
+            session,
+            "base prompt",
+            trusted_run_context=context,
+        ) is True
+        assert drained[0]["text"] == "STEER_LATE"
+        assert drained[0]["trusted_run_context"] is context
+        assert claimed == []
+        assert cxba_runtime.get_run(context.run_id).status == "RUNNING"
+        assert context.run_id in terminal_tool._task_env_overrides
+    finally:
+        if context.run_id in terminal_tool._task_env_overrides:
+            destroy_run_sandbox(context.run_id)
+        cxba_runtime.detach_completed_run(context.run_id, "COMPLETED")
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-late-steer", None)
+
+
 def _assert_cxba_retention_probe_failure_keeps_run(
     monkeypatch, tmp_path, caplog, *, run_id, configure_failure
 ):
@@ -5430,11 +6136,11 @@ def _assert_cxba_retention_probe_failure_keeps_run(
         assert started is True
         record = cxba_runtime.get_run(run_id)
         assert record is not None
-        assert record.status == "UNREACHABLE"
+        assert record.status == "RUNNING"
         assert record.sandbox_registered is True
         assert run_id in terminal_tool._task_env_overrides
         kinds = [kind for kind, _sid, _payload in emitted]
-        assert "heartbeat.lost" in kinds
+        assert "heartbeat.lost" not in kinds
         assert "run.diagnostic" in kinds
         assert not any(
             kind in {"sandbox.stopped", "run.completed", "run.failed", "run.background"}
@@ -5449,7 +6155,7 @@ def _assert_cxba_retention_probe_failure_keeps_run(
         server._sessions.pop(sid, None)
 
 
-def test_pending_approval_probe_failure_keeps_sandbox_unreachable(
+def test_pending_approval_probe_failure_keeps_last_run_state(
     monkeypatch, tmp_path, caplog
 ):
     def configure_failure(cxba_runtime):
@@ -5467,7 +6173,7 @@ def test_pending_approval_probe_failure_keeps_sandbox_unreachable(
     )
 
 
-def test_active_delegation_probe_failure_keeps_sandbox_unreachable(
+def test_active_delegation_probe_failure_keeps_last_run_state(
     monkeypatch, tmp_path, caplog
 ):
     from tools import async_delegation
