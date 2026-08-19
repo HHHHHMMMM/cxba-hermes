@@ -21,6 +21,13 @@ COVERAGES = {"FULL", "PARTIAL", "NONE"}
 SOURCE_OPTIONAL_TYPES = {"HYPOTHESIS", "GAP"}
 SOURCE_ROLES = {"SUPPORT", "COUNTER"}
 ROW_LOCATORS = {"EXCEL_RANGE", "PARQUET_ROWS", "DUCKDB_ROWS"}
+LOCATOR_TYPES = ROW_LOCATORS | {
+    "CSV_LINES",
+    "PDF_PAGE",
+    "WORD_ANCHOR",
+    "IMAGE_REGION",
+    "NEAREST",
+}
 OOXML_REQUIRED_MEMBERS = {
     ".xlsx": {"[Content_Types].xml", "xl/workbook.xml"},
     ".xlsm": {"[Content_Types].xml", "xl/workbook.xml"},
@@ -218,6 +225,9 @@ def validate_locator(source: dict[str, Any], label: str, errors: list[str]) -> N
     if not locator_type or not isinstance(locator, dict) or not locator:
         errors.append(f"{label}缺少locatorType或非空locator")
         return
+    if locator_type not in LOCATOR_TYPES:
+        errors.append(f"{label}.locatorType无效")
+        return
     if locator_type == "EXCEL_RANGE" and not clean(locator.get("sheet")):
         errors.append(f"{label}的Excel定位缺少Sheet")
     if locator_type in {"PARQUET_ROWS", "DUCKDB_ROWS"} and not clean(locator.get("table")):
@@ -232,10 +242,20 @@ def validate_locator(source: dict[str, Any], label: str, errors: list[str]) -> N
             locator, "startLine", "endLine"
         ):
             errors.append(f"{label}缺少有效原始行定位")
-    elif locator_type == "PDF_PAGE":
-        pages = locator.get("pages")
-        if not (isinstance(locator.get("page"), int) and locator["page"] > 0) and not positive_ints(pages):
+    elif locator_type in {"PDF_PAGE", "IMAGE_REGION"}:
+        if not (isinstance(locator.get("page"), int) and not isinstance(locator.get("page"), bool) and locator["page"] > 0):
             errors.append(f"{label}缺少有效页码")
+        bbox = locator.get("bbox")
+        if bbox is not None and (
+            not isinstance(bbox, list)
+            or len(bbox) != 4
+            or any(not isinstance(item, (int, float)) or isinstance(item, bool) for item in bbox)
+        ):
+            errors.append(f"{label}.bbox无效")
+    elif locator_type in {"WORD_ANCHOR", "NEAREST"} and not any(
+        clean(locator.get(key)) for key in ("heading", "paragraph", "table", "anchor")
+    ):
+        errors.append(f"{label}缺少有效文字锚点")
 
 
 def validate_workspace_file(
@@ -321,7 +341,9 @@ def validate(workspace: Path, answer_path: Path) -> list[str]:
             errors.append(f"{label}.claimType无效")
         if clean(claim.get("coverage")) not in COVERAGES:
             errors.append(f"{label}.coverage无效")
-        if not isinstance(claim.get("limitations"), list):
+        if not isinstance(claim.get("limitations"), list) or any(
+            not clean(item) for item in claim.get("limitations", [])
+        ):
             errors.append(f"{label}.limitations必须是数组")
         sources = claim.get("sourceRefs")
         calculations = claim.get("calculationRefs")
@@ -355,6 +377,8 @@ def validate(workspace: Path, answer_path: Path) -> list[str]:
                 errors.append(f"{source_label}的materialId与relativePath未精确映射")
             if clean(source.get("role")) not in SOURCE_ROLES:
                 errors.append(f"{source_label}.role无效")
+            if not clean(source.get("description")):
+                errors.append(f"{source_label}.description不能为空")
             validate_locator(source, source_label, errors)
         published_metrics: dict[str, dict[str, Any]] = {}
         has_artifact_paths = False
@@ -363,6 +387,10 @@ def validate(workspace: Path, answer_path: Path) -> list[str]:
             if not isinstance(calculation, dict):
                 errors.append(f"{calc_label}必须是对象")
                 continue
+            if not clean(calculation.get("purpose")):
+                errors.append(f"{calc_label}.purpose不能为空")
+            if not clean(calculation.get("calculationBasis")):
+                errors.append(f"{calc_label}.calculationBasis不能为空")
             script_file = validate_workspace_file(
                 workspace, calculation.get("scriptPath"), f"{calc_label}.scriptPath", errors
             )
@@ -429,8 +457,25 @@ def main() -> int:
     errors = validate(args.workspace.resolve(), args.answer.resolve())
     if errors:
         print("CLAIM_DELIVERY_FAIL")
+        print(f"ERROR_COUNT={len(errors)}")
         for error in errors:
             print(f"- {error}")
+        print("修正方式：按上面的Claim序号、引用序号和字段名修改对应文件，然后重新运行同一预检命令。")
+        if len(errors) > 20 or sum(
+            any(marker in error for marker in (
+                ".description不能为空",
+                ".purpose不能为空",
+                ".calculationBasis不能为空",
+                "必须是对象",
+                "必须是数组",
+            ))
+            for error in errors
+        ) >= 3:
+            print(
+                "REGENERATE_FROM_SKILL：错误较多或合同结构不完整。请重新通过skill_view完整读取"
+                "cxba-claim-delivery及references/final-claim-delivery.md，按合同重新生成本轮"
+                "final-claims.json和final-answer.md，再重跑预检；不要凭记忆零散补字段。"
+            )
         return 1
     print("CLAIM_DELIVERY_PASS")
     return 0

@@ -98,9 +98,10 @@ def _reasoning_aware_request_overrides(
 
     Bailian-compatible Qwen endpoints use ``extra_body.enable_thinking`` while
     local llama.cpp/vLLM-compatible servers commonly use
-    ``chat_template_kwargs.enable_thinking``.  The custom-provider body opts
-    into one of those wire contracts; this function only changes configured
-    booleans and never adds a field to endpoints that did not declare it.
+    ``chat_template_kwargs.enable_thinking``.  The local Qwen3.8 MLX endpoint
+    declares ``extra_body.reasoning_effort`` and accepts only none, low,
+    medium, or xhigh.  The custom-provider body opts into one of those wire
+    contracts; this function only changes fields the endpoint declared.
     """
     if not isinstance(request_overrides, dict) or not isinstance(reasoning_config, dict):
         return request_overrides
@@ -112,7 +113,8 @@ def _reasoning_aware_request_overrides(
     nested_configured = isinstance(template_kwargs, dict) and isinstance(
         template_kwargs.get("enable_thinking"), bool
     )
-    if not top_level_configured and not nested_configured:
+    effort_configured = isinstance(extra_body.get("reasoning_effort"), str)
+    if not top_level_configured and not nested_configured and not effort_configured:
         return request_overrides
 
     enabled = reasoning_config.get("enabled") is not False
@@ -126,6 +128,14 @@ def _reasoning_aware_request_overrides(
         updated_template = dict(template_kwargs)
         updated_template["enable_thinking"] = enabled
         updated_body["chat_template_kwargs"] = updated_template
+    if effort_configured:
+        requested_effort = str(reasoning_config.get("effort") or "").strip().lower()
+        if not enabled:
+            updated_body["reasoning_effort"] = "none"
+        elif requested_effort in {"low", "medium", "xhigh"}:
+            updated_body["reasoning_effort"] = requested_effort
+        else:
+            updated_body["reasoning_effort"] = "medium"
     updated["extra_body"] = updated_body
     return updated
 

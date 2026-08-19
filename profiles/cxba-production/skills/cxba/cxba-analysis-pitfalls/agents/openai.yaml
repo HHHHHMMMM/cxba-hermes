@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXBA分析注意事项"
+  short_description: "在材料解析、统计、图分析和证据交付前复用已验证避坑规则"
+  default_prompt: "Use $cxba-analysis-pitfalls before analyzing CXBA case materials or writing analysis scripts."

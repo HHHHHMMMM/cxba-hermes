@@ -236,6 +236,130 @@ def validate_delegations(
     return errors
 
 
+def validate_questions(
+    records: list[tuple[str, dict[str, str]]],
+    final: bool,
+    transaction_analysis: str,
+    transaction_reason: str,
+) -> list[str]:
+    errors: list[str] = []
+    required = (
+        "状态",
+        "来源",
+        "分析维度",
+        "专项Skill",
+        "选择理由",
+        "问题",
+        "对象与角色",
+        "已检查范围",
+        "支持假设",
+        "正常解释",
+        "反向假设",
+        "证据或缺口",
+        "未覆盖与原因",
+        "下一步",
+        "报告Claim",
+    )
+    valid_statuses = {
+        "OPEN",
+        "IN_PROGRESS",
+        "VERIFIED",
+        "EXCLUDED",
+        "GAP",
+        "NOT_APPLICABLE",
+    }
+    terminal_statuses = {"VERIFIED", "EXCLUDED", "GAP", "NOT_APPLICABLE"}
+    transaction_dimensions = {
+        "ACCOUNT_COVERAGE",
+        "DIRECT_FLOW",
+        "INDIRECT_FLOW",
+        "CROSS_SOURCE",
+        "TEMPORAL",
+        "COUNTER_EVIDENCE",
+        "MATERIAL_GAP",
+    }
+    seen_ids: set[str] = set()
+    dimensions: set[str] = set()
+    for record_id, fields in records:
+        if record_id in seen_ids:
+            errors.append(f"问题编号重复：{record_id}")
+        seen_ids.add(record_id)
+        require_fields("问题", record_id, fields, required, errors)
+        status = fields.get("状态", "")
+        if status not in valid_statuses:
+            errors.append(f"问题 {record_id} 状态非法：{status}")
+        if final and status not in terminal_statuses:
+            errors.append(f"问题 {record_id} 报告前未达到终态：{status}")
+        dimension = fields.get("分析维度", "")
+        if dimension:
+            dimensions.add(dimension)
+        if status == "NOT_APPLICABLE" and fields.get("未覆盖与原因", "") in {"", "无"}:
+            errors.append(f"问题 {record_id} NOT_APPLICABLE但未说明原因")
+
+    if final and not records:
+        errors.append("首次结案缺少问题覆盖矩阵")
+    if transaction_analysis not in {"REQUIRED", "NOT_APPLICABLE"}:
+        errors.append("交易分析必须为REQUIRED或NOT_APPLICABLE")
+    elif transaction_analysis == "NOT_APPLICABLE":
+        if transaction_reason in {"", "无"}:
+            errors.append("交易分析NOT_APPLICABLE必须说明业务理由")
+    elif final:
+        missing = sorted(transaction_dimensions - dimensions)
+        if missing:
+            errors.append(f"交易分析问题覆盖不完整：{','.join(missing)}")
+    return errors
+
+
+def validate_techniques(
+    records: list[tuple[str, dict[str, str]]],
+    final: bool,
+    catalog_status: str,
+) -> list[str]:
+    errors: list[str] = []
+    required = (
+        "技战法路径",
+        "标题",
+        "状态",
+        "适用场景",
+        "所需材料",
+        "现有材料",
+        "缺失材料",
+        "适用判断",
+        "转入问题",
+    )
+    valid_statuses = {"APPLICABLE", "COMPLETED", "DATA_MISSING", "NOT_APPLICABLE"}
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
+    for record_id, fields in records:
+        if record_id in seen_ids:
+            errors.append(f"技战法编号重复：{record_id}")
+        seen_ids.add(record_id)
+        require_fields("技战法", record_id, fields, required, errors)
+        path = fields.get("技战法路径", "")
+        if path in seen_paths:
+            errors.append(f"技战法路径重复：{path}")
+        seen_paths.add(path)
+        status = fields.get("状态", "")
+        if status not in valid_statuses:
+            errors.append(f"技战法 {record_id} 状态非法：{status}")
+        if final and status == "APPLICABLE":
+            errors.append(f"技战法 {record_id} 报告前仍未执行：APPLICABLE")
+        if status == "COMPLETED" and fields.get("转入问题", "") in {"", "无"}:
+            errors.append(f"技战法 {record_id} COMPLETED但未转入调查问题")
+        if status == "DATA_MISSING" and fields.get("缺失材料", "") in {"", "无"}:
+            errors.append(f"技战法 {record_id} DATA_MISSING但未写缺失材料")
+        if status == "NOT_APPLICABLE" and fields.get("适用判断", "") in {"", "无"}:
+            errors.append(f"技战法 {record_id} NOT_APPLICABLE但未说明理由")
+
+    if catalog_status not in {"COMPLETED", "NONE"}:
+        errors.append("技战法目录检查必须为COMPLETED或NONE")
+    elif catalog_status == "COMPLETED" and not records:
+        errors.append("技战法目录检查COMPLETED但没有覆盖记录")
+    elif catalog_status == "NONE" and records:
+        errors.append("技战法目录检查NONE但存在覆盖记录")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--inventory", type=Path, required=True)
@@ -258,6 +382,31 @@ def main() -> int:
         )
         errors.extend(
             validate_delegations(parse_records(args.state, "D", 3), args.final)
+        )
+        state_text = args.state.read_text(encoding="utf-8")
+        transaction_analysis = clean(
+            re.search(r"(?m)^交易分析[：:]\s*(\S.*?)\s*$", state_text).group(1)
+        ) if re.search(r"(?m)^交易分析[：:]\s*(\S.*?)\s*$", state_text) else ""
+        transaction_reason = clean(
+            re.search(r"(?m)^交易分析不适用理由[：:]\s*(\S.*?)\s*$", state_text).group(1)
+        ) if re.search(r"(?m)^交易分析不适用理由[：:]\s*(\S.*?)\s*$", state_text) else ""
+        errors.extend(
+            validate_questions(
+                parse_records(args.state, "Q", 3),
+                args.final,
+                transaction_analysis,
+                transaction_reason,
+            )
+        )
+        technique_status_match = re.search(
+            r"(?m)^技战法目录检查[：:]\s*(\S.*?)\s*$", state_text
+        )
+        errors.extend(
+            validate_techniques(
+                parse_records(args.state, "T", 3),
+                args.final,
+                clean(technique_status_match.group(1)) if technique_status_match else "",
+            )
         )
 
     payload = {"status": "failed" if errors else "passed", "errors": errors}

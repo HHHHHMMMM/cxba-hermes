@@ -1,19 +1,10 @@
 model:
-  provider: custom:cxba-bailian
-  default: "${env:CXBA_LOCAL_MODEL}"
-  base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
-  context_length: 65536
+  provider: openai-codex
+  default: gpt-5.5
+  context_length: 272000
+  max_tokens: 38000
 
 fallback_providers: []
-
-custom_providers:
-  - name: cxba-bailian
-    base_url: "${env:CXBA_LOCAL_MODEL_BASE_URL}"
-    model: "${env:CXBA_LOCAL_MODEL}"
-    key_env: CXBA_BAILIAN_API_KEY
-    api_mode: chat_completions
-    extra_body:
-      enable_thinking: false
 
 memory:
   memory_enabled: false
@@ -32,7 +23,7 @@ terminal:
   backend: docker
   cwd: /workspace
   docker_image: cxba-hermes-sandbox:local
-  docker_network: true
+  docker_network: false
   docker_mount_cwd_to_workspace: false
   container_persistent: false
 

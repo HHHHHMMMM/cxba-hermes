@@ -195,6 +195,23 @@ check_model() {
 	fi
 }
 
+configured_provider() {
+	sed -n '/^model:/,/^[^[:space:]]/s/^[[:space:]]*provider:[[:space:]]*//p' "${PROFILE_SOURCE}/config.yaml" | head -1
+}
+
+check_inference() {
+	local provider
+	provider=$(configured_provider)
+	if [[ "${provider}" == "openai-codex" ]]; then
+		"${HERMES_BIN}" auth status openai-codex 2>/dev/null | grep -q 'logged in' || {
+			echo "Codex OAuth is not logged in for Hermes." >&2
+			return 1
+		}
+		return 0
+	fi
+	check_model
+}
+
 sync_managed_profile_skills() {
 	local source_skills="${PROFILE_SOURCE}/skills"
 	local target_skills="${PROFILE_HOME}/skills"
@@ -218,7 +235,7 @@ start_gateway() {
 	[[ -x "${HERMES_BIN}" ]] || { echo "Hermes executable not found: ${HERMES_BIN}" >&2; return 1; }
 	command -v tmux >/dev/null 2>&1 || { echo "tmux is required to run Hermes Gateway persistently." >&2; return 1; }
 	prepare_environment
-	check_model
+	check_inference
 	sync_managed_profile_skills
 	mkdir -p "$(dirname "${LOG_FILE}")" "$(dirname "${PID_FILE}")"
 
@@ -295,8 +312,12 @@ show_status() {
 	fi
 	echo "Hermes Gateway: running (pid=${pid}, port=${PORT}, profile=${PROFILE})"
 	inherit_gateway_environment "${pid}"
-	if check_model; then
-		echo "Model service: reachable (${CXBA_LOCAL_MODEL} at ${CXBA_LOCAL_MODEL_BASE_URL})"
+	if check_inference; then
+		if [[ "$(configured_provider)" == "openai-codex" ]]; then
+			echo "Model service: Codex OAuth logged in (gpt-5.5)"
+		else
+			echo "Model service: reachable (${CXBA_LOCAL_MODEL} at ${CXBA_LOCAL_MODEL_BASE_URL})"
+		fi
 	else
 		echo "Model service: unavailable"
 		return 1

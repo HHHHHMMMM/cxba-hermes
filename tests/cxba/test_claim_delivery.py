@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -155,6 +156,44 @@ def test_calculation_requires_existing_script_and_result(tmp_path):
 
     assert delivered["evidence_status"] == "INVALID"
     assert delivered["evidence_errors"] == ["calculation_script_missing"]
+
+
+def test_gateway_requires_source_description_and_calculation_explanation(tmp_path):
+    run, workspace = _run(tmp_path)
+    (workspace / "scripts").mkdir()
+    (workspace / "results").mkdir()
+    (workspace / "scripts" / "sum.py").write_text("# fixture\n", encoding="utf-8")
+    (workspace / "results" / "sum.json").write_text("{}\n", encoding="utf-8")
+    claim = _fact_claim()
+    claim["claimType"] = "CALCULATION"
+    claim["calculationRefs"] = [
+        {
+            "scriptPath": "scripts/sum.py",
+            "resultPath": "results/sum.json",
+            "purpose": "汇总金额",
+            "calculationBasis": "收入方向，排除冲正",
+        }
+    ]
+
+    cases = (
+        (("sourceRefs", 0, "description"), "source_description_missing"),
+        (("calculationRefs", 0, "purpose"), "calculation_purpose_missing"),
+        (("calculationRefs", 0, "calculationBasis"), "calculation_basis_missing"),
+    )
+    target = workspace / "evidence-items" / "final-claims.json"
+    target.parent.mkdir()
+    for path, expected in cases:
+        incomplete = deepcopy(claim)
+        incomplete[path[0]][path[1]].pop(path[2])
+        target.write_text(
+            json.dumps({"claims": [incomplete]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        delivered = read_claim_delivery(run, "金额结论 [C001]")
+
+        assert delivered["evidence_status"] == "INVALID"
+        assert delivered["evidence_errors"] == [expected]
 
 
 def test_prepare_removes_previous_run_result(tmp_path):

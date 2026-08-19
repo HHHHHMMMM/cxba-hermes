@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-
 import yaml
 
-from agent.agent_init import _merge_custom_provider_extra_body
 from agent.transports import get_transport
 from hermes_cli.profile_distribution import read_manifest
 from toolsets import resolve_toolset
@@ -69,7 +66,7 @@ def test_production_profile_has_no_cross_session_memory_or_external_fallback() -
 def test_production_profile_disables_runtime_network_and_context_files() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
     assert config["terminal"]["backend"] == "docker"
-    assert config["terminal"]["docker_network"] is True
+    assert config["terminal"]["docker_network"] is False
     assert config["terminal"]["container_persistent"] is False
     assert "timeout" not in config["terminal"]
     assert "lifetime_seconds" not in config["terminal"]
@@ -78,38 +75,40 @@ def test_production_profile_disables_runtime_network_and_context_files() -> None
     assert api_config["load_soul_identity"] is False
 
 
-def test_local_model_must_be_deployment_configured() -> None:
+def test_deployment_model_must_be_configured() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
-    assert config["model"]["provider"] == "custom:cxba-bailian"
-    assert config["model"]["default"] == "${env:CXBA_LOCAL_MODEL}"
-    assert config["model"]["base_url"] == "${env:CXBA_LOCAL_MODEL_BASE_URL}"
-    [provider] = config["custom_providers"]
-    assert provider["name"] == "cxba-bailian"
-    assert provider["key_env"] == "CXBA_BAILIAN_API_KEY"
-    assert provider["extra_body"] == {"enable_thinking": False}
+    assert config["model"]["provider"] == "openai-codex"
+    assert config["model"]["default"] == "gpt-5.5"
+    assert "base_url" not in config["model"]
+    assert config["model"]["context_length"] == 272000
+    assert config["model"]["max_tokens"] == 38000
+    assert "custom_providers" not in config
 
 
 def test_production_provider_thinking_follows_each_session_reasoning_setting() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
-    agent = SimpleNamespace(
-        provider=config["model"]["provider"],
-        model=config["model"]["default"],
-        base_url=config["model"]["base_url"],
-        request_overrides={},
-    )
-    _merge_custom_provider_extra_body(agent, config["custom_providers"])
-    transport = get_transport("chat_completions")
+    transport = get_transport("codex_responses")
 
-    for enabled, effort in ((True, "medium"), (False, "none")):
+    for enabled, effort, expected in (
+        (True, "medium", "medium"),
+        (False, "none", None),
+        (True, "xhigh", "xhigh"),
+        (True, "high", "high"),
+    ):
         kwargs = transport.build_kwargs(
-            model=agent.model,
+            model=config["model"]["default"],
             messages=[{"role": "user", "content": "Hi"}],
             tools=[],
             reasoning_config={"enabled": enabled, "effort": effort},
-            request_overrides=agent.request_overrides,
+            provider=config["model"]["provider"],
+            base_url="https://chatgpt.com/backend-api/codex",
+            is_codex_backend=True,
         )
 
-        assert kwargs["extra_body"]["enable_thinking"] is enabled
+        if expected is None:
+            assert "reasoning" not in kwargs
+        else:
+            assert kwargs["reasoning"]["effort"] == expected
 
 
 def test_private_gateway_storage_and_spring_mcp_are_environment_bound() -> None:

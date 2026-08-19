@@ -7,6 +7,8 @@ description: Discover reproducible time patterns and candidate transaction chain
 
 读取交易材料内容前加载`cxba-analysis-notebook`，逐文件即时记录真实结构、覆盖、主要内容、可用字段、候选及反证定位。本Skill产生进入最终回答的统计事实、时序候选或缺口时加载`cxba-claim-delivery`。
 
+编写或修改事件适配器/临时脚本，或者开展金额、方向、去重、图和图时序计算及结果复核前，加载`cxba-analysis-pitfalls`并按需读取已验证规则；当前上下文已完整读取时不重复加载。
+
 ## Mandatory execution path
 1. On every start or resume, inspect `/workspace/scripts` and `/workspace/results`; reuse valid artifacts and continue at the next unfinished step.
 2. Inspect the source and read [event-contract.md](references/event-contract.md), then create or reuse exactly one source adapter under `/workspace/scripts`; fix it in place.
@@ -26,7 +28,7 @@ description: Discover reproducible time patterns and candidate transaction chain
 Required fields are `event_id`, `timestamp`, `payer_id`, `receiver_id`, `amount`, `currency`, `source_file`, `source_sheet`, `source_row`.
 
 - Confirm headers, time format and precision, units, currency, payer/receiver fields, stable ids, own-account rules, duplicate observations and original row locations. Preserve source rows before filtering or sorting.
-- Use a stable account id when an account field exists. Use a resolved subject id only when source data proves the account-to-subject mapping and the adapter applies that mapping consistently to both sides. Never use a party name as `payer_id` or `receiver_id`, and never discard an endpoint merely because customer id is blank when its account is present. A retained unknown endpoint must use an observation-scoped unique id; exclude and count rows with neither endpoint identifiable.
+- Node identity is an analysis key, not a person-master merge decision. Use an account when present; otherwise use a source-scoped customer id, then a source-and-role-scoped normalized party name, and finally an observation-scoped unique id. A name-level node may be used for statistics and candidate paths inside its source, but must carry `SOURCE_NAME_LEVEL` and must not be merged across sources merely because the normalized names match. Use a resolved subject id only when material or user-provided evidence supports the mapping and the adapter applies it consistently to both sides. Never discard an endpoint merely because strong identity fields are absent.
 - Set `business_key` only from a stable event-level key. If keyed rows conflict on time, parties, amount or currency, repair the adapter; leave the key blank or use a source detail key. Never remove extension fields to bypass the conflict.
 - Transaction code, name and summary are clues only. Keep an edge when account/subject fields identify a real counterparty. Exclude or deduplicate only when source structure proves a pure internal mirror with no real counterparty or a repeated observation; record basis and counts. Compare separate scopes when uncertain.
 - Write one normalization summary with read/accepted/excluded counts, reasons, currencies, time range, identity rules, unresolved identities and duplicate handling. Keep full events on disk. Report keyed, unkeyed and merged counts; when no stable `business_key` exists, state that duplicate-looking observations remain separate and never claim they were treated as one event.
@@ -35,12 +37,14 @@ Do not write the adapter from memory or inference alone. The event contract is m
 
 ## Transaction semantics
 
+- 候选发现不以交易对手身份、关系或人员主档强标识已知为前提。调查对象可以由案件或用户给出的姓名、别名、账户、客户号及材料中的实际字段定位；存在同名或归属歧义时分开保留并披露。交易对手按账户级、客户号级、来源内姓名级或观测级节点继续计算。先用统计、图和图时序算法发现直接交易、汇聚、发散、回转和多跳候选，再只对有限高价值候选回查开户资料、人事档案、主档、用户说明及其他材料，补充`IDENTITY_RESOLVED | IDENTITY_UNRESOLVED`和`RELATION_RESOLVED | RELATION_UNRESOLVED`。身份或关系未知的候选不得被过滤，按`HYPOTHESIS`或`GAP`报告交易对手姓名或账户、客观交易特征、原始定位和调证动作。
 - Define direction from the target account or subject: an event is incoming only when `receiver_id` equals that target and outgoing only when `payer_id` equals it. A non-empty payer or receiver name does not establish direction. Report self-transfers separately; never treat one as pass-through evidence.
 - Sheet names and source files locate observations; they do not define the graph's allowed nodes. Keep identified external counterparties and allow a path to enter or leave the set of profiled Sheets.
 - For rapid pass-through or chain candidates, require same currency and strict timestamp order. Put exact or near-exact amount continuity in the first tier, then rank the amount that remains supported and elapsed time. Report the continuity threshold, amount difference and retained percentage; do not let a trivial amount win solely because it is a few seconds faster.
 - Do not pair every incoming event with every later outgoing event. An event may support only one selected match unless the source proves a split, merge or duplicate observation. When several assignments remain plausible, report the ambiguity and unmatched balance instead of multiplying candidates.
 - Night or off-hours analysis must report the declared time window, total-activity denominator, count share and amount share for comparable subjects or periods. Absolute night totals alone do not establish concentration.
 - Temporal proximity and amount similarity produce a candidate only. Never state that two rows are the same money or that conduct is abnormal without corroborating evidence.
+- Discovery favors recall but still requires an observable trigger from the data: amount, frequency, concentration, timing, direction, convergence, fan-out, return, path continuity, source conflict or departure from a declared baseline. Every materially grounded candidate must remain traceable through the notebook, evidence ledger and report. Counter-evidence never silently deletes a candidate: report the trigger and counter-evidence together under `暂拟排除的疑点`, explain why exclusion is provisional and what would reopen it. Candidates without sufficient counter-evidence remain under `待核疑点`. Pure speculation with no observable trigger is not a candidate.
 
 ## Standard bounded commands
 

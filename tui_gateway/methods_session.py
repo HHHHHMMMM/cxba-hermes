@@ -3817,10 +3817,17 @@ def _(rid, params: dict) -> dict:
                     ),
                     reason="cxba_force_stop",
                 )
-                destroy_run_sandbox(run.run_id)
-                _emit("force_stop.completed", sid, {"status": "FORCE_STOPPED"})
-                detach_completed_run(run.run_id, "FORCE_STOPPED")
-                session.pop("active_cxba_run_id", None)
+                # A live turn owns its Sandbox until its conversation thread
+                # reaches the common finally block. Publishing completion or
+                # detaching here lets a new Run overlap the old model loop.
+                if not run_thread_alive:
+                    destroy_run_sandbox(run.run_id)
+                    _emit("force_stop.completed", sid, {"status": "FORCE_STOPPED"})
+                    detach_completed_run(run.run_id, "FORCE_STOPPED")
+                    session.pop("active_cxba_run_id", None)
+                session.pop("_cxba_prepared_run", None)
+            else:
+                session.pop("_cxba_prepared_run", None)
         except Exception as exc:
             logger.exception("event=force_stop stage=destroy status=failed sessionId=%s", sid)
             return _err(rid, 5032, f"force stop could not remove the Run sandbox: {exc}")
@@ -4173,6 +4180,12 @@ def _(rid, params: dict) -> dict:
     actor_user_id = str(params.get("actor_user_id") or "").strip()
     if not text or not prompt or not actor_user_id:
         return _err(rid, 4002, "text, prompt and actor_user_id are required")
+    reasoning_effort = str(
+        params.get("reasoning_effort")
+        or ("medium" if params.get("reasoning_enabled") else "none")
+    ).strip().lower()
+    if reasoning_effort not in {"none", "medium", "xhigh"}:
+        return _err(rid, 4002, "reasoning_effort must be none, medium or xhigh")
     sid = str(params.get("session_id") or "")
     from tui_gateway.cxba_runtime import run_for_session
 
@@ -4188,7 +4201,8 @@ def _(rid, params: dict) -> dict:
             "attachments": list(params.get("attachments") or []),
             "actor_user_id": actor_user_id,
             "created_at": time.time(),
-            "reasoning_enabled": bool(params.get("reasoning_enabled")),
+            "reasoning_enabled": reasoning_effort != "none",
+            "reasoning_effort": reasoning_effort,
         }
         inbox.append(item)
     try:
@@ -4213,6 +4227,12 @@ def _(rid, params: dict) -> dict:
     prompt = str(params.get("prompt") or "").strip()
     if not message_id or not text or not prompt:
         return _err(rid, 4002, "message_id, text and prompt are required")
+    reasoning_effort = str(
+        params.get("reasoning_effort")
+        or ("medium" if params.get("reasoning_enabled") else "none")
+    ).strip().lower()
+    if reasoning_effort not in {"none", "medium", "xhigh"}:
+        return _err(rid, 4002, "reasoning_effort must be none, medium or xhigh")
     inbox = _cxba_prompt_inbox(session)
     with session["history_lock"]:
         if session.get("_cxba_prompt_claim_pending") == message_id:
@@ -4223,7 +4243,8 @@ def _(rid, params: dict) -> dict:
         item["text"] = text
         item["prompt"] = prompt
         item["attachments"] = list(params.get("attachments") or [])
-        item["reasoning_enabled"] = bool(params.get("reasoning_enabled"))
+        item["reasoning_enabled"] = reasoning_effort != "none"
+        item["reasoning_effort"] = reasoning_effort
     try:
         _persist_cxba_prompt_inbox(session)
     except Exception as exc:

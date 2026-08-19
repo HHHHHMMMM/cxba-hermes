@@ -1168,6 +1168,32 @@ def test_cxba_step_and_terminal_presentation_are_emitted(monkeypatch):
     assert events[4][2]["presentation"]["exit_code"] == 0
 
 
+def test_cxba_mutation_presentation_declares_only_created_or_modified_locations():
+    assert server._tool_presentation("write_file", {"path": "out/report.md"})["locations"] == [
+        {"path": "out/report.md"}
+    ]
+    assert server._tool_presentation(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": """*** Begin Patch
+*** Update File: out/report.md
+@@
+-old
++new
+*** Add File: out/summary.md
++summary
+*** Delete File: out/obsolete.md
+*** End Patch""",
+        },
+    )["locations"] == [
+        {"path": "out/report.md"},
+        {"path": "out/summary.md"},
+    ]
+    assert "locations" not in server._tool_presentation("read_file", {"path": "input.xlsx"})
+    assert "locations" not in server._tool_presentation("terminal", {"command": "touch out/hidden.txt"})
+
+
 def test_dispatch_rejects_non_object_request():
     resp = server.dispatch([])
 
@@ -1651,12 +1677,20 @@ def test_prompt_submit_accepts_valid_run_context_from_private_transport(
                     "global_master_links": [],
                     "investigation_mode": "STANDARD",
                     "material_catalog": [],
+                    "task_context": {
+                        "kind": "KNOWLEDGE_COAUTHOR",
+                        "sourcePath": "/workspace/.cxba-coauthor/source.json",
+                        "draftPath": "/workspace/.cxba-coauthor/draft.md",
+                        "manifestPath": "/workspace/.cxba-coauthor/manifest.json",
+                        "recoveryRule": "已有草稿先读取并继续修改",
+                    },
                 },
             },
         })
         assert "result" in response, response
         assert response["result"]["status"] == "streaming"
         assert captured["trusted_run_context"].run_id == "run-1"
+        assert captured["trusted_case_context"]["task_context"]["kind"] == "KNOWLEDGE_COAUTHOR"
     finally:
         reset_transport(token)
         server._sessions.pop(sid, None)
@@ -4002,6 +4036,8 @@ def test_cxba_prompt_queue_keeps_messages_independent_and_editable(monkeypatch):
                 "text": "第一条",
                 "prompt": "第一条模型内容",
                 "actor_user_id": "user-1",
+                "reasoning_enabled": True,
+                "reasoning_effort": "xhigh",
             },
         })
         second = server.handle_request({
@@ -4019,6 +4055,7 @@ def test_cxba_prompt_queue_keeps_messages_independent_and_editable(monkeypatch):
 
         assert first_id != second_id
         assert [item["text"] for item in second["result"]["items"]] == ["第一条", "第二条"]
+        assert first["result"]["item"]["reasoning_effort"] == "xhigh"
 
         updated = server.handle_request({
             "id": "update-1",
@@ -4028,10 +4065,13 @@ def test_cxba_prompt_queue_keeps_messages_independent_and_editable(monkeypatch):
                 "message_id": first_id,
                 "text": "第一条已修改",
                 "prompt": "第一条模型内容已修改",
+                "reasoning_enabled": True,
+                "reasoning_effort": "medium",
             },
         })
         assert updated["result"]["items"][0]["message_id"] == first_id
         assert updated["result"]["items"][0]["text"] == "第一条已修改"
+        assert updated["result"]["items"][0]["reasoning_effort"] == "medium"
 
         deleted = server.handle_request({
             "id": "delete-2",
@@ -5766,6 +5806,78 @@ def test_run_prompt_submit_uses_run_task_key_and_destroys_sandbox(
         server._sessions.pop("sid-run-finally", None)
 
 
+def test_proposal_does_not_retain_run_or_sandbox(monkeypatch, tmp_path):
+    from tools.run_sandbox import RunMount, TrustedRunContext
+    from tui_gateway import cxba_runtime
+
+    emitted = []
+    destroyed = []
+
+    class ProposalAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            server._on_tool_complete(
+                "sid-proposal-complete",
+                "tool-proposal",
+                "mcp__cxba_spring__cxba_propose_case_memory_update",
+                {},
+                '{"proposal_id":"proposal-1","status":"PENDING_APPROVAL"}',
+            )
+            return {"final_response": "proposal created", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cxba_runtime._thread,
+        "start_new_thread",
+        lambda _target, _args: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    monkeypatch.setattr(
+        "tools.run_sandbox.destroy_run_sandbox",
+        lambda run_id: destroyed.append(run_id),
+    )
+    context = TrustedRunContext(
+        case_id="case-proposal-complete",
+        business_session_id="business-proposal-complete",
+        business_branch_id="branch-proposal-complete",
+        run_id="run-proposal-complete",
+        actor_user_id="user-proposal-complete",
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-proposal-complete"),
+        ),
+    )
+    session = _session(
+        session_key="stored-proposal-complete",
+        agent=ProposalAgent([]),
+        running=True,
+    )
+    server._sessions["sid-proposal-complete"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid-proposal-complete",
+            "sid-proposal-complete",
+            session,
+            "create proposal and finish",
+            trusted_run_context=context,
+        ) is True
+
+        assert destroyed == [context.run_id]
+        assert cxba_runtime.get_run(context.run_id).status == "COMPLETED"
+        assert any(kind == "approval.requested" for kind, _sid, _payload in emitted)
+        assert any(kind == "run.completed" for kind, _sid, _payload in emitted)
+        assert not any(kind == "run.waiting_approval" for kind, _sid, _payload in emitted)
+    finally:
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-proposal-complete", None)
+
+
 def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
     monkeypatch, tmp_path
 ):
@@ -5857,7 +5969,7 @@ def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
         assert len(turns) == 1
         assert "read /case/Memory.md completely" in turns[0]
         assert "Trusted approval result" in turns[0]
-        assert turns[0].endswith("wait for human approval.")
+        assert turns[0].endswith("finish the current read-only task without waiting for that decision.")
         assert record.status == "SAFE_STOPPED"
         assert "active_cxba_run_id" not in session
         assert context.run_id not in terminal_tool._task_env_overrides
@@ -5868,6 +5980,70 @@ def test_run_prompt_submit_finishes_safe_stop_after_approval_pure_text(
         terminal_tool.clear_task_env_overrides(context.run_id)
         cxba_runtime.reset_for_tests()
         server._sessions.pop("sid-safe-stop", None)
+
+
+def test_run_prompt_submit_publishes_force_stop_only_from_real_turn_finally(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+    from tools.run_sandbox import RunMount, TrustedRunContext
+    from tui_gateway import cxba_runtime
+
+    emitted = []
+    context = TrustedRunContext(
+        case_id="case-force-stop",
+        business_session_id="business-session-force-stop",
+        business_branch_id="branch-force-stop",
+        run_id="run-force-stop-finally",
+        actor_user_id="user-force-stop",
+        mounts=(
+            RunMount(str(tmp_path), "/workspace", False),
+            _cxba_memory_mount(tmp_path, "case-force-stop"),
+        ),
+    )
+
+    class _ForceStoppingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            cxba_runtime.force_stop_run(context.run_id)
+            return {"final_response": "", "messages": [], "interrupted": True}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload or {})
+        ),
+    )
+    session = _session(
+        session_key="stored-force-stop",
+        agent=_ForceStoppingAgent([]),
+        running=True,
+    )
+    server._sessions["sid-force-stop"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid-force-stop",
+            "sid-force-stop",
+            session,
+            "stop during this turn",
+            trusted_run_context=context,
+        ) is True
+
+        record = cxba_runtime.get_run(context.run_id)
+        assert record is not None
+        assert record.status == "FORCE_STOPPED"
+        assert "active_cxba_run_id" not in session
+        assert context.run_id not in terminal_tool._task_env_overrides
+        event_types = [event_type for event_type, _sid, _payload in emitted]
+        assert "force_stop.completed" in event_types
+        assert "run.completed" not in event_types
+        assert "run.failed" not in event_types
+    finally:
+        terminal_tool.clear_task_env_overrides(context.run_id)
+        cxba_runtime.reset_for_tests()
+        server._sessions.pop("sid-force-stop", None)
 
 
 def test_run_prompt_submit_marks_returned_error_run_failed(monkeypatch, tmp_path):
@@ -5930,7 +6106,7 @@ def test_run_prompt_submit_marks_returned_error_run_failed(monkeypatch, tmp_path
         assert len(turns) == 1
         assert "read /case/Memory.md completely" in turns[0]
         assert "trigger provider failure" in turns[0]
-        assert turns[0].endswith("wait for human approval.")
+        assert turns[0].endswith("finish the current read-only task without waiting for that decision.")
         assert cxba_runtime.get_run(context.run_id).status == "FAILED"
         assert context.run_id not in terminal_tool._task_env_overrides
         assert any(kind == "run.failed" for kind, _sid, _payload in emitted)
@@ -5999,7 +6175,7 @@ def test_run_prompt_submit_keeps_background_only_run_sandbox(monkeypatch, tmp_pa
         assert len(turns) == 1
         assert "read /case/Memory.md completely" in turns[0]
         assert "delegate work" in turns[0]
-        assert turns[0].endswith("wait for human approval.")
+        assert turns[0].endswith("finish the current read-only task without waiting for that decision.")
         assert cxba_runtime.get_run(context.run_id).status == "RUNNING"
         assert context.run_id in terminal_tool._task_env_overrides
         assert any(kind == "run.background" for kind, _sid, _payload in emitted)
@@ -6270,7 +6446,7 @@ def test_run_prompt_submit_keeps_undelivered_approval_result_running(
         assert len(turns) == 1
         assert "read /case/Memory.md completely" in turns[0]
         assert "ordinary queued message" in turns[0]
-        assert turns[0].endswith("wait for human approval.")
+        assert turns[0].endswith("finish the current read-only task without waiting for that decision.")
         assert record.status == "RUNNING"
         assert cxba_runtime.has_undelivered_approval_results(context.run_id) is True
         assert context.run_id in terminal_tool._task_env_overrides
@@ -11350,6 +11526,58 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
 
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert calls["interrupted"] is True
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_run_prompt_submit_does_not_clear_cancel_during_agent_ready_handoff(monkeypatch):
+    """A stop between the wrapper check and the real turn must win permanently.
+
+    The deferred prompt wrapper checks ``_turn_cancel_requested`` before calling
+    ``_run_prompt_submit``.  Force stop can arrive immediately after that check;
+    the inner function must re-check under the history lock before clearing the
+    agent interrupt or re-attaching the business Run.
+    """
+    calls = {"cleared": 0, "started": 0}
+    threads = []
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            calls["started"] += 1
+
+        def is_alive(self):
+            return True
+
+    agent = types.SimpleNamespace(
+        clear_interrupt=lambda: calls.__setitem__("cleared", calls["cleared"] + 1),
+        run_conversation=lambda *args, **kwargs: {},
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        _turn_cancel_requested=True,
+    )
+    server._sessions["sid"] = session
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+        assert server._run_prompt_submit("1", "sid", session, "cancelled") is False
+        assert calls == {"cleared": 0, "started": 0}
+        assert threads == []
+        assert session["running"] is False
+
+        # A later, explicitly submitted turn starts normally after the caller
+        # establishes a fresh running/cancel generation.
+        session["running"] = True
+        session["_turn_cancel_requested"] = False
+        assert server._run_prompt_submit("2", "sid", session, "next") is True
+        assert calls == {"cleared": 1, "started": 1}
+        assert len(threads) == 1
     finally:
         server._sessions.pop("sid", None)
 

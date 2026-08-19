@@ -38,6 +38,21 @@ python3 /root/.hermes/skills/cxba/cxba-safe-tabular-analysis/scripts/case_materi
 4. Word、RTF 和 PDF 检查正文与表格；扫描件结合 OCR 与页面核对。CSV、TXT 先确认编码、分隔符和实际字段。压缩包先查看成员列表，再读取相关成员。
 5. 只有原件字段和对应记录能够确认主体、角色、日期、金额方向或业务性质；名称相似、位置相邻和文件名描述只能作为定位线索。
 
+## ZIP安全解压
+
+任务需要读取 ZIP 包内内容时，不得直接调用`unzip`、`ZipFile.extractall()`或编写临时解压代码。先从`/workspace/input/materials.json`取得该 ZIP 的真实`materialId`和`/data`路径，再运行统一脚本：
+
+```bash
+python3 \
+  /root/.hermes/skills/cxba/cxba-material-profiling/scripts/safe_extract_archive.py \
+  --archive '/data/<真实ZIP相对路径>' \
+  --material-id '<Spring材料记录标识>'
+```
+
+脚本只读`/data`，将成员写入`/workspace/extracted/<materialId>`，并生成`archive-manifest.json`，逐项记录原始 ZIP、包内路径、解压路径、类型和大小。再次处理同一材料时复用已完成清单，不重复解压；发现半成品目录、路径穿越、符号链接、重复成员、异常压缩比、单项或总量超限时失败关闭并记录真实错误。
+
+ZIP加密但没有用户明确提供的密码时，记录`ARCHIVE_PASSWORD_REQUIRED`材料缺口并请求密码，不得猜测。解压文件属于本 Session Workspace 分析副本，不得表述为新增原始材料；Run文件事件和终态索引会按现有机制把它们登记为`WORKSPACE`文件。解压后先读取清单，再按成员真实类型选择表格、文档、OCR或其他专项 Skill。
+
 有限样本只用于理解结构和决定下一步，不能据此声称未读范围的合计、规律或全量结论。
 
 ## 长材料与大表

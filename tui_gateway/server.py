@@ -5841,6 +5841,28 @@ def _tool_presentation(
     else:
         title = name
     presentation: dict[str, object] = {"card": card, "title": title}
+    locations: list[dict[str, str]] = []
+    if name == "write_file":
+        path = args.get("path") or args.get("file_path")
+        if isinstance(path, str) and path.strip():
+            locations.append({"path": path.strip()})
+    elif name == "patch":
+        mode = str(args.get("mode") or "replace")
+        if mode == "patch":
+            patch_text = args.get("patch")
+            if isinstance(patch_text, str):
+                seen: set[str] = set()
+                for match in re.finditer(r"^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$", patch_text, re.MULTILINE):
+                    path = match.group(1).strip()
+                    if path and path not in seen:
+                        seen.add(path)
+                        locations.append({"path": path})
+        else:
+            path = args.get("path") or args.get("file_path")
+            if isinstance(path, str) and path.strip():
+                locations.append({"path": path.strip()})
+    if locations:
+        presentation["locations"] = locations
     if description:
         presentation["description"] = description
     workdir = args.get("workdir")
@@ -6040,9 +6062,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     if run is not None:
         proposal_id = observe_tool_result(run.run_id, result)
         if proposal_id:
-            # A proposal does not make the Run idle.  WAITING_APPROVAL is
-            # emitted only by the turn finalizer once Hermes has actually
-            # stopped doing read-only work.
+            # Spring owns the proposal after creation. It remains visible for
+            # human approval but does not retain this Run or Sandbox.
             _emit(
                 "approval.requested",
                 sid,
@@ -8158,6 +8179,10 @@ def _public_cxba_prompt_item(item: dict) -> dict:
         "actor_user_id": str(item.get("actor_user_id") or ""),
         "created_at": float(item.get("created_at") or 0),
         "reasoning_enabled": bool(item.get("reasoning_enabled")),
+        "reasoning_effort": str(
+            item.get("reasoning_effort")
+            or ("medium" if item.get("reasoning_enabled") else "none")
+        ),
     }
 
 
@@ -10454,6 +10479,16 @@ def _run_prompt_submit(
     trusted_case_context: dict[str, Any] | None = None,
     consumes_cxba_approvals: bool = False,
 ) -> bool:
+    # Close the final cancellation race at the lazy-build handoff.  The outer
+    # prompt wrapper checks this flag after waiting for the agent, but Stop can
+    # arrive immediately after that check and before this function acquires the
+    # history lock.  Never re-attach a business Run or clear the agent's hard
+    # interrupt once that cancellation generation has won.
+    with session["history_lock"]:
+        if session.get("_turn_cancel_requested") or not session.get("running"):
+            session["running"] = False
+            _clear_inflight_turn(session)
+            return False
     active_run_id = str(session.get("active_cxba_run_id") or "")
     if active_run_id:
         from tui_gateway.cxba_runtime import get_run
@@ -10484,6 +10519,14 @@ def _run_prompt_submit(
             )
             return False
     with session["history_lock"]:
+        # Re-check after trusted Run preparation: force stop may race with the
+        # filesystem/run-context attachment work above.  Holding the same lock
+        # used by session.interrupt makes this check and clear_interrupt atomic
+        # with respect to a new hard stop.
+        if session.get("_turn_cancel_requested") or not session.get("running"):
+            session["running"] = False
+            _clear_inflight_turn(session)
+            return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
@@ -11395,10 +11438,12 @@ def _run_prompt_submit(
             approval_pending = False
             approval_delivery_pending = False
             background_active = False
+            force_stopping = False
             retention_probe_failed = False
             if trusted_run_context is not None:
                 try:
                     from tui_gateway.cxba_runtime import (
+                        force_stop_requested,
                         has_pending_proposals,
                         has_undelivered_approval_results,
                         mark_waiting_approval,
@@ -11417,6 +11462,14 @@ def _run_prompt_submit(
                     background_active = _cxba_run_has_background_work(
                         trusted_run_context.run_id, sid, session
                     )
+                    force_stopping = force_stop_requested(
+                        trusted_run_context.run_id
+                    )
+                    if force_stopping:
+                        keep_run_sandbox = False
+                        approval_pending = False
+                        approval_delivery_pending = False
+                        background_active = False
                     keep_run_sandbox = keep_run_sandbox or background_active
                     if approval_pending:
                         mark_waiting_approval(trusted_run_context.run_id)
@@ -11495,14 +11548,18 @@ def _run_prompt_submit(
                         or safe_stop_requested(trusted_run_context.run_id)
                     )
                     terminal_status = (
-                        "SAFE_STOPPED"
+                        "FORCE_STOPPED"
+                        if force_stopping
+                        else "SAFE_STOPPED"
                         if safe_stopped
                         else "FAILED" if turn_failed else "COMPLETED"
                     )
                     _emit("sandbox.stopped", sid, {"status": terminal_status})
                     _emit(
                         (
-                            "safe_stop.completed"
+                            "force_stop.completed"
+                            if force_stopping
+                            else "safe_stop.completed"
                             if safe_stopped
                             else "run.failed" if turn_failed else "run.completed"
                         ),
@@ -11511,6 +11568,7 @@ def _run_prompt_submit(
                     )
                     detach_completed_run(trusted_run_context.run_id, terminal_status)
                     session.pop("active_cxba_run_id", None)
+                    session.pop("_cxba_prepared_run", None)
                 except Exception:
                     logger.error(
                         "event=run_sandbox stage=destroy status=failed runId=%s",

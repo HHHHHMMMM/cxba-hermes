@@ -63,9 +63,10 @@
 - `FACT`、`CALCULATION`、`RELATION`和`FINDING`至少有一个原始`sourceRef`。没有原始支持只能降为`HYPOTHESIS`或`GAP`，不得伪装为已证事实。
 - `materialId`、`relativePath`和`sandboxPath`只能从当前`/workspace/input/materials.json`同一条记录逐字复制，严禁凭记忆、相似数字、文件名或同名副本推断。未编目文件不得借同名文件的materialId；可形成`HYPOTHESIS`或`GAP`并说明材料登记缺口。
 - `role`使用`SUPPORT`或`COUNTER`。反证、正常解释和来源冲突也要定位到原件。
+- 每个`sourceRef.description`必须是非空文字，说明该原始位置具体支持或反驳什么；不能只填写文件名、`见原件`或工作区笔记路径。
 - Excel使用`EXCEL_RANGE`及真实Sheet；CSV使用`CSV_LINES`；Parquet/DuckDB使用`PARQUET_ROWS`或`DUCKDB_ROWS`及表名；PDF使用`PDF_PAGE`；Word、RTF、图片或扫描件使用`WORD_ANCHOR`、`IMAGE_REGION`或`NEAREST`并说明限制。
 - 连续表格证据用`startRow/endRow`或`startLine/endLine`；不连续证据用升序、不重复的`rows`或`lines`。不得用首尾范围包住中间无关记录。
-- `CALCULATION`必须有非空且不重复的`metricCodes`，以及实际存在的`scriptPath`和`resultPath`，均为`/workspace`下安全相对路径。`resultPath`只能指向UTF-8 JSON，且包含对应`publishedMetrics`；脚本和结果证明计算过程，不能替代原件定位。
+- `CALCULATION`必须有非空且不重复的`metricCodes`。每个`calculationRef`必须同时包含非空`scriptPath`、`resultPath`、`purpose`和`calculationBasis`：前两项是`/workspace`下实际存在的安全相对路径；`purpose`说明该脚本和结果支持哪项计算；`calculationBasis`完整说明字段、筛选、方向、期间、币种、状态、空值、冲正、去重及其他实际口径。不得省略、改名或只写在`userBasis`。`resultPath`只能指向UTF-8 JSON，且包含对应`publishedMetrics`；脚本和结果证明计算过程，不能替代原件定位。
 - `.xlsx/.xls/.docx/.pptx/.pdf/.parquet/.duckdb`是二进制文件，禁止使用`read_text()`或字符集参数读取。二进制结果只列入`calculationRefs.artifactPaths`，由相应格式解析器或容器检查；CSV、TSV、JSON、Markdown等文本结果统一写UTF-8。
 - 每个发布指标的`reportBlock`由计算脚本生成，必须逐字进入同一Claim的`statement`和最终回复，禁止模型重新心算、手抄或改写数字。存在`artifactPaths`时，脚本必须在文件落盘后重新打开交付物：`sourceValue`记录原始数据独立复算值，`artifactValue`记录交付物回读值；两值不一致立即停止交付。
 - 最终回复、分析笔记、计算脚本和结果中只要同时写出文件路径与`materialId`，二者必须与`materials.json`同一条记录一致。计算脚本需要材料身份时运行时读取`materials.json`，不得硬编码标识；修改任一材料身份后必须同步全部交付物并重跑证据校验。
@@ -76,4 +77,4 @@
 
 没有原始证据时，`HYPOTHESIS`或`GAP`可以使用空`sourceRefs`并正常结束任务，但最终回答必须明确“推测”或“材料缺口”。有原始证据的Claim校验失败时，不得声称证据已核验；可以修正后重跑，或按真实证据强度降级后完成。
 
-校验脚本的完整输出和退出码必须由当前主Agent读取。首行是`CLAIM_DELIVERY_FAIL`时，后续每条错误均为待修正项；逐项修正并重跑，直到最新一次执行退出码为0且首行是`CLAIM_DELIVERY_PASS`。不得吞掉非0退出码或把Gateway事后`INVALID`警告当作已经完成回复前校验。
+校验脚本的完整输出和退出码必须由当前主Agent读取。首行是`CLAIM_DELIVERY_FAIL`时，后续每条错误和`修正方式`均为待执行事项。少量错误按Claim、引用和字段逐项修正；错误很多、多个必填字段缺失或出现`REGENERATE_FROM_SKILL`时，重新通过`skill_view`完整读取本Skill及本合同，重新生成本轮`final-claims.json`和`final-answer.md`，不要凭记忆补字段。修正后重跑，直到最新一次执行退出码为0且首行是`CLAIM_DELIVERY_PASS`。不得吞掉非0退出码或把Gateway事后`INVALID`警告当作已经完成回复前校验。

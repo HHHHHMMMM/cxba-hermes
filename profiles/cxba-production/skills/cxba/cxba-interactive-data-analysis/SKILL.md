@@ -9,6 +9,8 @@ description: 对案件Excel、XLS、CSV、RTF、Word、PDF和文本材料回答�
 
 第一次读取材料内容前加载`cxba-analysis-notebook`，用`/workspace/analysis-notebook.md`记录本轮实际处理的每个文件；处理完一个文件必须先落笔记再读下一个。不要为专项问题盘点或补读无关文件。
 
+编写或修改材料适配器/临时脚本，或者开展金额、方向、去重、图计算和结果复核前，加载`cxba-analysis-pitfalls`并按需读取已验证规则；当前上下文已完整读取时不重复加载。
+
 ## 1. Resolve the requested scope
 
 Extract the dimensions that matter to the requested result:
@@ -87,6 +89,18 @@ State the requested figures or candidates in the answer itself. Scripts and resu
 
 Never infer business nature from amount, periodicity, filename, blank summary, same surname, or adjacent files. If the source field does not establish a category, write `性质待核实`. Keep facts, calculations, and interpretations separate.
 
-## 5. Deliver traceable claims
+## 5. 人员、企业和账户关系专项
+
+用户要求梳理或核查人员、企业、账户及其关系时，先形成候选清单和证据状态，不因“梳理”“看看关系”“画关系图”自动提交任何业务写入提案。只有用户在当前对话中明确要求登记、写入或形成提案时，才调用Spring业务提案工具；用户说“先给我看”“不着急写”时必须停在分析结果，不得抢先提案。
+
+候选人员较多且用户要求选择“重点”“最相关”或限定人数时，根据当前案件问题综合人员与调查对象的直接关系、原件明示亲属或任职关系、职务与业务环节、资金联系、企业角色、账户联系、时间对应和多来源相互印证进行排序，并在结果中说明每人入选依据。不得只按姓名出现次数、单笔金额、交易总额或模型主观印象排名；未入选不等于排除或无关。
+
+身份、主档和正式关系分别处理：同名、同单位、同地址、共同交易、资金路径或共同任职不能自动合并人员，也不能单独证明亲属、朋友、账户归属、企业控制或资金来源。人员、企业和账户主档按Spring提供的强标识规则归并；企业缺少完整统一社会信用代码或注册号、人员缺少可用强标识、账户缺少类型和完整账户ID时，只保留候选或缺口，不编造标识。正式关系必须有当前案件原始材料明确支持，普通交易联系只作为资金联系或待核候选。
+
+用户要求关系图时，在当前Session Workspace生成有界关系图和对应关系清单。图中必须区分`已由原件支持的正式关系`、`仅观察到的交易联系`和`尚待核实的推测关系`，节点与边都能回到清单及原始来源；不得为了图面完整补造关系。
+
+用户明确要求提交提案后，先调用`cxba_read_dictionaries`取得当前允许的关系代码，再按匹配的主档和关系提案工具分别提交。只提交强标识完整、关系类型明确且原始材料可定位的项目；证据不足、身份冲突或仅由交易推测的项目留在待核清单。提案只是待人工审批的业务建议，不得声称已经写入或已经认定事实。
+
+## 6. Deliver traceable claims
 
 本轮最终回答包含材料事实、计算、关系、规律候选、业务判断、假设或缺口时，加载`cxba-claim-delivery`并完整执行其统一合同。只交付本轮回答实际使用的claims；不得转入完整案件清单或完整案件终检。

@@ -21,6 +21,8 @@ from validate_investigation_notebook import (
     validate_delegations,
     validate_evidence,
     validate_materials,
+    validate_questions,
+    validate_techniques,
 )
 
 
@@ -375,11 +377,24 @@ def validate_final(workspace: Path) -> list[str]:
     material_records = parse_records(material_ledger, "M", 2)
     evidence_records = parse_records(evidence_ledger, "E", 2)
     delegation_records = parse_records(state_path, "D", 3)
+    question_records = parse_records(state_path, "Q", 3)
+    technique_records = parse_records(state_path, "T", 3)
     errors.extend(validate_materials(inventory, material_records, True))
     errors.extend(validate_evidence(inventory, evidence_records))
     errors.extend(validate_delegations(delegation_records, True))
 
     state_text = state_path.read_text(encoding="utf-8")
+    errors.extend(validate_questions(
+        question_records,
+        True,
+        state_field(state_text, "交易分析"),
+        state_field(state_text, "交易分析不适用理由"),
+    ))
+    errors.extend(validate_techniques(
+        technique_records,
+        True,
+        state_field(state_text, "技战法目录检查"),
+    ))
     closure = state_field(state_text, "结案覆盖")
     content_statuses = [fields.get("内容审阅") for _, fields in material_records]
     if closure not in {"PARTIAL", "FULL"}:
@@ -430,6 +445,9 @@ def validate_final(workspace: Path) -> list[str]:
             errors.append(f"claim {code}类型非法：{claim_type}")
         if coverage not in COVERAGES:
             errors.append(f"claim {code} coverage非法：{coverage}")
+        limitations = claim.get("limitations")
+        if not isinstance(limitations, list) or any(not str(item or "").strip() for item in limitations):
+            errors.append(f"claim {code} limitations必须是非空字符串数组")
         if f"[{code}]" not in report or not statement or statement not in report:
             errors.append(f"claim {code}陈述或标签未与最终报告一致")
         if closure != "FULL" and coverage == "FULL":
@@ -454,6 +472,8 @@ def validate_final(workspace: Path) -> list[str]:
                 errors.append(f"claim {code}来源路径不在物理薄清单：{relative}")
             if by_id.get(material_id) != relative or by_path.get(relative) != material_id:
                 errors.append(f"claim {code} materialId与物理路径不精确一致：{material_id} -> {relative}")
+            if not str(source.get("description") or "").strip():
+                errors.append(f"claim {code} sourceRefs[{source_index}]缺少description")
         metric_codes = claim.get("metricCodes")
         if claim_type == "CALCULATION":
             if not isinstance(metric_codes, list) or not metric_codes or any(not isinstance(item, str) or not item for item in metric_codes):
@@ -464,6 +484,10 @@ def validate_final(workspace: Path) -> list[str]:
                 if not isinstance(calculation, dict):
                     errors.append(f"claim {code} calculationRefs[{calc_index}]不是对象")
                     continue
+                if not str(calculation.get("purpose") or "").strip():
+                    errors.append(f"claim {code} calculationRefs[{calc_index}]缺少purpose")
+                if not str(calculation.get("calculationBasis") or "").strip():
+                    errors.append(f"claim {code} calculationRefs[{calc_index}]缺少calculationBasis")
                 workspace_file(workspace, calculation.get("scriptPath"), f"claim {code}计算脚本", errors)
                 result_file = workspace_file(workspace, calculation.get("resultPath"), f"claim {code}计算结果", errors)
                 if result_file:
@@ -503,8 +527,17 @@ def validate_final(workspace: Path) -> list[str]:
                 errors.append(f"报告第{line_number}行使用强定性词但未标为HYPOTHESIS/GAP")
 
     evidence_by_claim: dict[str, list[dict[str, str]]] = {}
+    pending_suspicion = False
+    provisionally_excluded = False
     for evidence_id, fields in evidence_records:
         codes = split_codes(fields.get("报告Claim", ""))
+        evidence_status = fields.get("状态", "")
+        if evidence_status in {"CANDIDATE", "HYPOTHESIS", "GAP"}:
+            pending_suspicion = True
+        if evidence_status == "REFUTED":
+            provisionally_excluded = True
+        if evidence_status in {"CANDIDATE", "HYPOTHESIS", "REFUTED", "GAP"} and not codes:
+            errors.append(f"疑点证据{evidence_id}未进入最终报告Claim")
         source = fields.get("文件", "")
         material_id = fields.get("materialId", "")
         catalog_id = by_path.get(source)
@@ -521,8 +554,14 @@ def validate_final(workspace: Path) -> list[str]:
                 errors.append(f"证据{evidence_id}映射不存在的claim：{code}")
             else:
                 evidence_by_claim.setdefault(code, []).append(fields)
+                if evidence_status == "REFUTED" and claim_by_code[code].get("claimType") != "HYPOTHESIS":
+                    errors.append(f"暂拟排除疑点{evidence_id}必须映射HYPOTHESIS claim")
                 if not catalog_id and claim_by_code[code].get("claimType") != "GAP":
                     errors.append(f"未编目证据{evidence_id}只能映射GAP claim")
+    if pending_suspicion and "待核疑点" not in report:
+        errors.append("最终报告缺少待核疑点章节")
+    if provisionally_excluded and "暂拟排除的疑点" not in report:
+        errors.append("最终报告缺少暂拟排除的疑点章节")
     for code, claim in claim_by_code.items():
         mapped = evidence_by_claim.get(code, [])
         if not mapped:

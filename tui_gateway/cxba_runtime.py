@@ -26,9 +26,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-_CASE_CONTEXT_KEYS = frozenset(
+_CASE_CONTEXT_REQUIRED_KEYS = frozenset(
     {"case_basic", "global_master_links", "investigation_mode", "material_catalog"}
 )
+_CASE_CONTEXT_OPTIONAL_KEYS = frozenset({"task_context"})
+_COAUTHOR_TASK_KEYS = frozenset(
+    {"kind", "sourcePath", "draftPath", "manifestPath", "recoveryRule"}
+)
+_COAUTHOR_TASK_PATHS = {
+    "sourcePath": "/workspace/.cxba-coauthor/source.json",
+    "draftPath": "/workspace/.cxba-coauthor/draft.md",
+    "manifestPath": "/workspace/.cxba-coauthor/manifest.json",
+}
 _CASE_MEMORY_TARGET = "/case/Memory.md"
 _INVESTIGATION_MODES = frozenset({"STANDARD", "FULL_CASE"})
 
@@ -55,9 +64,15 @@ def validate_session_binding(raw: Any) -> dict[str, Any]:
 
 
 def validate_case_context(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict) or set(raw) != _CASE_CONTEXT_KEYS:
+    if not isinstance(raw, dict):
+        raise ValueError("case_context must be an object")
+    keys = set(raw)
+    if not _CASE_CONTEXT_REQUIRED_KEYS.issubset(keys) or not keys.issubset(
+        _CASE_CONTEXT_REQUIRED_KEYS | _CASE_CONTEXT_OPTIONAL_KEYS
+    ):
         raise ValueError(
-            "case_context must contain only case_basic, global_master_links and material_catalog"
+            "case_context must contain case_basic, global_master_links, investigation_mode "
+            "and material_catalog, with optional task_context"
         )
     if not isinstance(raw["case_basic"], dict):
         raise ValueError("case_context.case_basic must be an object")
@@ -68,6 +83,17 @@ def validate_case_context(raw: Any) -> dict[str, Any]:
         raise ValueError("case_context.investigation_mode must be STANDARD or FULL_CASE")
     if not isinstance(raw["material_catalog"], list):
         raise ValueError("case_context.material_catalog must be an array")
+    if "task_context" in raw:
+        task_context = raw["task_context"]
+        if not isinstance(task_context, dict) or set(task_context) != _COAUTHOR_TASK_KEYS:
+            raise ValueError("case_context.task_context has an invalid knowledge coauthor contract")
+        if task_context.get("kind") != "KNOWLEDGE_COAUTHOR":
+            raise ValueError("case_context.task_context.kind must be KNOWLEDGE_COAUTHOR")
+        for key, expected in _COAUTHOR_TASK_PATHS.items():
+            if task_context.get(key) != expected:
+                raise ValueError(f"case_context.task_context.{key} has an invalid path")
+        if not str(task_context.get("recoveryRule") or "").strip():
+            raise ValueError("case_context.task_context.recoveryRule is required")
     current = copy.deepcopy(raw)
     current["investigation_mode"] = investigation_mode
     return current
@@ -130,7 +156,8 @@ def binding_system_context(binding: dict[str, Any] | None) -> str | None:
         "mounts shared case long-term memory read-only at /case/Memory.md. When trusted "
         "Gateway turn text says this memory is new or changed, read the complete file "
         "with the terminal before substantive analysis. Never edit it directly; propose "
-        "a complete replacement with cxba_propose_case_memory_update for human approval. "
+        "a complete replacement with cxba_propose_case_memory_update for later human approval, "
+        "then finish the current read-only analysis without waiting for that decision. "
         "The control plane refreshes /workspace/input/materials.json at the start of "
         "every Run. Except when the trusted current-Run context explicitly directs "
         "FULL_CASE activation, for any "
@@ -138,12 +165,19 @@ def binding_system_context(binding: dict[str, Any] | None) -> str | None:
         "review case materials or conclusions, first load and follow the "
         "cxba-analysis-router Skill with skill_view. Load only the specialist Skills "
         "selected by that Router. Before the first material-content read, load "
-        "cxba-analysis-notebook and record each processed file immediately. Before a "
+        "cxba-analysis-notebook and record each processed file immediately. Before "
+        "parsing unfamiliar material, writing or changing an adapter or temporary script, "
+        "or performing amount, direction, deduplication, graph or result-review work, "
+        "load cxba-analysis-pitfalls and apply its relevant verified rules; do not reload "
+        "it while its full content remains available in the current context. Before a "
         "final answer containing material facts, calculations, relations, findings, "
         "hypotheses, or gaps, load cxba-claim-delivery and complete its generic claim "
         "delivery. Do not scan /workspace for original materials or invent paths. "
-        "Write derived files only "
-        "below /workspace.\n"
+        "Write derived files only below /workspace. In a final answer, mention the "
+        "main files successfully created or modified during the current Run using "
+        "Markdown inline code. Use the exact tool path, or a basename only when it "
+        "uniquely identifies one current-Run output; do not claim reads, deleted "
+        "files, failed writes, or terminal side effects as produced files.\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
@@ -163,12 +197,23 @@ def case_context_model_prompt(case_context: dict[str, Any] | None) -> str | None
             "authority": "Gateway trusted Run context",
         },
     }
+    if "task_context" in current:
+        payload["task_context"] = current["task_context"]
     prompt = (
         "CXBA current Run context follows. It was refreshed by the control plane for "
         "this Run. The Gateway-held catalog is authoritative for evidence validation; "
         "/workspace/input/materials.json is the model-readable copy.\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
+    if "task_context" in current:
+        prompt += (
+            "\nCXBA trusted knowledge coauthor protocol: this task remains knowledge "
+            "coauthoring after context compression. Before further analysis, read the "
+            "existing draft.md and manifest.json first when they exist and continue "
+            "editing the same files. If either file is missing, read the compact "
+            "source.json and immediately create the first usable draft.md, then write "
+            "manifest.json. Do not restart broad source analysis after compression."
+        )
     if current["investigation_mode"] != "FULL_CASE":
         return prompt
     return prompt + (
@@ -222,7 +267,8 @@ def case_memory_reload_prompt(
         "required even for an acknowledgement-only request; do not let the requested "
         "answer format suppress the tool call. Read first, then follow the requested "
         "answer format. It is read-only; propose "
-        "updates with cxba_propose_case_memory_update and wait for human approval.",
+        "updates with cxba_propose_case_memory_update for later human approval, then "
+        "finish the current read-only task without waiting for that decision.",
         marker,
     )
 
@@ -733,6 +779,12 @@ def force_stop_run(run_id: str) -> RunRecord | None:
         return record
 
 
+def force_stop_requested(run_id: str) -> bool:
+    with _lock:
+        record = _runs.get(run_id)
+        return bool(record and record.status == "FORCE_STOPPING")
+
+
 def add_event(
     run_id: str, event_type: str, payload: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -924,7 +976,9 @@ def observe_tool_result(run_id: str, result: Any) -> str | None:
         record = _runs.get(run_id)
         if record is None:
             return None
-        record.pending_proposals.add(proposal_id)
+        # A proposal is durable Spring business state, not unfinished model
+        # work. The current Run may finish its remaining read-only analysis,
+        # then complete and release its Sandbox without waiting for a decision.
     return proposal_id
 
 

@@ -86,6 +86,7 @@ def test_session_binding_is_stable_and_run_context_is_dynamic() -> None:
     assert "material-1" not in system_context
     assert "cxba-analysis-router" in system_context
     assert "cxba-analysis-notebook" in system_context
+    assert "cxba-analysis-pitfalls" in system_context
     assert "cxba-claim-delivery" in system_context
     assert "/case/Memory.md" in system_context
     assert "cxba_propose_case_memory_update" in system_context
@@ -112,6 +113,38 @@ def test_full_case_mode_is_a_short_trusted_protocol_not_an_eager_skill_body() ->
     assert "does not preload or activate a Skill" in run_prompt
     assert "The full skill content is loaded below" not in run_prompt
     assert "# CXBA主调查Agent" not in run_prompt
+
+
+def test_knowledge_coauthor_context_survives_as_a_stable_run_protocol() -> None:
+    context = _case_context()
+    context["task_context"] = {
+        "kind": "KNOWLEDGE_COAUTHOR",
+        "sourcePath": "/workspace/.cxba-coauthor/source.json",
+        "draftPath": "/workspace/.cxba-coauthor/draft.md",
+        "manifestPath": "/workspace/.cxba-coauthor/manifest.json",
+        "recoveryRule": "已有草稿先读取并继续修改；没有草稿则读取source后立即生成第一版",
+    }
+
+    run_prompt = case_context_model_prompt(validate_case_context(context))
+
+    assert '"kind":"KNOWLEDGE_COAUTHOR"' in run_prompt
+    assert "remains knowledge coauthoring after context compression" in run_prompt
+    assert "read the existing draft.md and manifest.json first" in run_prompt
+    assert "immediately create the first usable draft.md" in run_prompt
+
+
+def test_knowledge_coauthor_context_rejects_untrusted_paths() -> None:
+    context = _case_context()
+    context["task_context"] = {
+        "kind": "KNOWLEDGE_COAUTHOR",
+        "sourcePath": "/tmp/source.json",
+        "draftPath": "/workspace/.cxba-coauthor/draft.md",
+        "manifestPath": "/workspace/.cxba-coauthor/manifest.json",
+        "recoveryRule": "继续草稿",
+    }
+
+    with pytest.raises(ValueError, match="sourcePath"):
+        validate_case_context(context)
 
 
 def test_case_memory_reloads_on_first_run_change_and_session_key_rotation(
@@ -315,7 +348,7 @@ def test_run_events_survive_registry_reset_and_fetch_after_position(
     assert recovered[0]["type"] == "tool.complete"
 
 
-def test_async_proposal_result_is_retained_for_same_run_and_sandbox(tmp_path: Path) -> None:
+def test_proposal_is_reported_without_becoming_pending_run_work(tmp_path: Path) -> None:
     run = _run(tmp_path)
     record, _created = attach_run(
         run_context=run,
@@ -327,23 +360,10 @@ def test_async_proposal_result_is_retained_for_same_run_and_sandbox(tmp_path: Pa
         {"result": '{"proposal_id":"proposal-1","status":"PENDING_APPROVAL"}'},
     )
     assert proposal_id == "proposal-1"
-    assert record.pending_proposals == {"proposal-1"}
-    assert record.status == "RUNNING"
-
-    queued = queue_approval_result(
-        "run-1",
-        proposal_id="proposal-1",
-        status="EXECUTED",
-        content={"affected_rows": 3},
-        pending_count=0,
-    )
-    assert queued["content"] == {"affected_rows": 3}
-    assert has_pending_proposals("run-1") is False
-    assert has_undelivered_approval_results("run-1") is True
-    assert record.status == "RUNNING"
-    assert drain_approval_events("run-1") == [queued]
-    assert has_undelivered_approval_results("run-1") is False
     assert record.pending_proposals == set()
+    assert record.status == "RUNNING"
+    assert has_pending_proposals("run-1") is False
+    assert has_undelivered_approval_results("run-1") is False
 
 
 def test_proposal_tool_event_does_not_mark_running_run_waiting(
@@ -377,7 +397,7 @@ def test_proposal_tool_event_does_not_mark_running_run_waiting(
     )
 
     assert record.status == "RUNNING"
-    assert record.pending_proposals == {"proposal-running"}
+    assert record.pending_proposals == set()
     assert ("approval.requested", {
         "proposal_id": "proposal-running",
         "status": "PENDING_APPROVAL",
@@ -385,7 +405,7 @@ def test_proposal_tool_event_does_not_mark_running_run_waiting(
     assert not any(event_type == "run.waiting_approval" for event_type, _ in emitted)
 
 
-def test_turn_cleanup_cannot_destroy_cxba_run_sandbox_while_approval_continues(
+def test_active_run_owns_sandbox_until_turn_finalizer_after_proposal(
     tmp_path: Path, monkeypatch
 ) -> None:
     from agent import chat_completion_helpers
@@ -415,16 +435,6 @@ def test_turn_cleanup_cannot_destroy_cxba_run_sandbox_while_approval_continues(
     assert runtime_owns_sandbox("run-1") is True
     assert cleaned == []
 
-    queue_approval_result(
-        "run-1",
-        proposal_id="proposal-1",
-        status="EXECUTED",
-        content={},
-        pending_count=0,
-    )
-    chat_completion_helpers.cleanup_task_resources(agent, "run-1")
-    assert record.sandbox_registered is True
-    assert cleaned == []
 
 
 def test_idle_reaper_cannot_destroy_runtime_owned_nonterminal_sandbox(
