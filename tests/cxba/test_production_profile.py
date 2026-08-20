@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 import yaml
 
-from agent.transports import get_transport
 from hermes_cli.profile_distribution import read_manifest
 from toolsets import resolve_toolset
 from tools.skills_sync import _discover_bundled_skills
@@ -77,38 +76,29 @@ def test_production_profile_disables_runtime_network_and_context_files() -> None
 
 def test_deployment_model_must_be_configured() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
-    assert config["model"]["provider"] == "openai-codex"
-    assert config["model"]["default"] == "gpt-5.5"
-    assert "base_url" not in config["model"]
-    assert config["model"]["context_length"] == 272000
-    assert config["model"]["max_tokens"] == 38000
-    assert "custom_providers" not in config
+    assert config["model"]["provider"] == "custom:cxba-remote-vllm"
+    assert config["model"]["default"] == "${env:CXBA_LOCAL_MODEL}"
+    assert config["model"]["context_length"] == "${env:CXBA_LOCAL_MODEL_CONTEXT_LENGTH}"
+    assert config["model"]["max_tokens"] == 32768
+    assert config["fallback_providers"] == []
+    assert config["custom_providers"] == [
+        {
+            "name": "cxba-remote-vllm",
+            "base_url": "${env:CXBA_LOCAL_MODEL_BASE_URL}",
+            "model": "${env:CXBA_LOCAL_MODEL}",
+            "api_mode": "chat_completions",
+            "max_output_tokens": 32768,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
+    ]
 
 
-def test_production_provider_thinking_follows_each_session_reasoning_setting() -> None:
+def test_production_provider_uses_openai_compatible_remote_runtime() -> None:
     config = yaml.safe_load((PROFILE / "config.yaml").read_text(encoding="utf-8"))
-    transport = get_transport("codex_responses")
-
-    for enabled, effort, expected in (
-        (True, "medium", "medium"),
-        (False, "none", None),
-        (True, "xhigh", "xhigh"),
-        (True, "high", "high"),
-    ):
-        kwargs = transport.build_kwargs(
-            model=config["model"]["default"],
-            messages=[{"role": "user", "content": "Hi"}],
-            tools=[],
-            reasoning_config={"enabled": enabled, "effort": effort},
-            provider=config["model"]["provider"],
-            base_url="https://chatgpt.com/backend-api/codex",
-            is_codex_backend=True,
-        )
-
-        if expected is None:
-            assert "reasoning" not in kwargs
-        else:
-            assert kwargs["reasoning"]["effort"] == expected
+    provider = config["custom_providers"][0]
+    assert provider["api_mode"] == "chat_completions"
+    assert provider["base_url"] == "${env:CXBA_LOCAL_MODEL_BASE_URL}"
+    assert provider["model"] == config["model"]["default"]
 
 
 def test_private_gateway_storage_and_spring_mcp_are_environment_bound() -> None:

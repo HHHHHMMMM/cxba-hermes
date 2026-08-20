@@ -16,9 +16,14 @@ from pathlib import Path
 
 MODULES = (
     "PIL",
+    "cairosvg",
     "duckdb",
     "docx",
+    "ebooklib",
     "matplotlib",
+    "mammoth",
+    "markdownify",
+    "nbconvert",
     "numpy",
     "odf",
     "openpyxl",
@@ -95,68 +100,63 @@ def main() -> None:
             f"pipModulePresent={pip_module_present}"
         )
 
+    inventory = args.workspace / "catalog" / "inventory.json"
+    tabular = args.workspace / "notes" / "tabular.json"
+    documents = args.workspace / "notes" / "documents.json"
     catalog = args.workspace / "catalog" / "materials.json"
-    profile = args.workspace / "notes" / "table-profile.json"
-    accounts = args.workspace / "results" / "accounts.jsonl"
-    amounts = args.workspace / "results" / "amounts.json"
-    document = args.workspace / "notes" / "synthetic-document.txt"
+    extracted_documents = args.workspace / "intermediate" / "documents"
     run_script(
-        "material_catalog.py",
-        "--catalog",
-        str(args.fixture / "spring-materials.json"),
-        "--data-root",
+        "case_material_inventory.py",
+        "--root",
         str(args.fixture / "data"),
         "--output",
-        str(catalog),
+        str(inventory),
     )
     run_script(
-        "tabular_profile.py",
-        "--catalog",
-        str(catalog),
-        "--material-id",
-        "synthetic-table",
+        "case_file_profiler.py",
+        "catalog",
+        "--root",
+        str(args.fixture / "data"),
         "--output",
-        str(profile),
+        str(tabular),
     )
     run_script(
-        "enumerate_accounts.py",
-        "--catalog",
-        str(catalog),
-        "--material-id",
-        "synthetic-table",
-        "--account",
-        "BANK_ACCOUNT=account",
-        "--name-column",
-        "name",
+        "case_document_profiler.py",
+        "--root",
+        str(args.fixture / "data"),
         "--output",
-        str(accounts),
+        str(documents),
+        "--extracted-dir",
+        str(extracted_documents),
     )
     run_script(
-        "decimal_summary.py",
-        "--catalog",
-        str(catalog),
-        "--material-id",
-        "synthetic-table",
-        "--amount-column",
-        "amount",
+        "build_material_catalog.py",
+        "--inventory",
+        str(inventory),
+        "--tabular",
+        str(tabular),
+        "--documents",
+        str(documents),
         "--output",
-        str(amounts),
-    )
-    run_script(
-        "document_extract.py",
-        "--catalog",
         str(catalog),
-        "--material-id",
-        "synthetic-document",
-        "--output-dir",
-        str(document.parent),
     )
 
-    amount_payload = json.loads(amounts.read_text(encoding="utf-8"))
-    account_payload = accounts.read_text(encoding="utf-8").splitlines()
-    if amount_payload["amount"] != "999999999999.31" or len(account_payload) != 2:
+    catalog_payload = json.loads(catalog.read_text(encoding="utf-8"))
+    summary_payload = json.loads(
+        (catalog.parent / "material-summary.json").read_text(encoding="utf-8")
+    )
+    document_payload = json.loads(documents.read_text(encoding="utf-8"))
+    statuses = {item.get("contentStatus") for item in catalog_payload.get("materials", [])}
+    if (
+        catalog_payload.get("fileCount") != 2
+        or catalog_payload.get("tabularFileCount") != 1
+        or catalog_payload.get("documentFileCount") != 1
+        or summary_payload.get("uncoveredFileCount") != 0
+        or statuses != {"complete", "tabular_profiled"}
+    ):
         raise SystemExit("cxba_sandbox_smoke_failed unexpected synthetic results")
-    if "Synthetic structure sample" not in document.read_text(encoding="utf-8"):
+    extracted_path = Path(document_payload["files"][0]["extractedText"])
+    if "Synthetic structure sample" not in extracted_path.read_text(encoding="utf-8"):
         raise SystemExit("cxba_sandbox_smoke_failed document extraction mismatch")
     print("cxba_sandbox_smoke_passed network=none fixture=synthetic")
 

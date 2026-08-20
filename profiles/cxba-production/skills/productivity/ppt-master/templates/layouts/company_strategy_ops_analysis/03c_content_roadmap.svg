@@ -1,0 +1,59 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#F7F9FC"/>
+  <rect x="0" y="0" width="1280" height="10" fill="#12355B"/>
+  <rect x="0" y="0" width="220" height="10" fill="#00A88E"/>
+
+  <text x="60" y="62" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="31" font-weight="700" fill="#12355B">{{PAGE_TITLE}}</text>
+  <rect x="60" y="84" width="1090" height="40" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+  <rect x="60" y="84" width="8" height="40" rx="4" fill="#00A88E"/>
+  <text x="84" y="110" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" font-weight="700" fill="#1F2937">{{KEY_MESSAGE}}</text>
+
+  <line x1="118" y1="292" x2="1162" y2="292" stroke="#D8E1EA" stroke-width="6"/>
+  <line x1="118" y1="292" x2="900" y2="292" stroke="#00A88E" stroke-width="6"/>
+
+  <g id="roadmap_phase_cards" font-family="Arial, 'Microsoft YaHei', sans-serif">
+    <circle cx="154" cy="292" r="26" fill="#12355B"/>
+    <text x="154" y="300" text-anchor="middle" font-size="20" font-weight="700" fill="#FFFFFF">1</text>
+    <rect x="80" y="342" width="235" height="168" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="104" y="382" font-size="19" font-weight="700" fill="#12355B">{{PHASE_1_TITLE}}</text>
+    <text x="104" y="418" font-size="14" fill="#64748B">战略校准 / 目标拆解</text>
+    <text x="104" y="452" font-size="13" fill="#64748B">里程碑、责任人与预算口径</text>
+    <rect x="104" y="474" width="92" height="24" rx="12" fill="#E6F7F4"/>
+    <text x="150" y="491" text-anchor="middle" font-size="12" font-weight="700" fill="#007C6B">启动</text>
+
+    <circle cx="424" cy="292" r="26" fill="#00A88E"/>
+    <text x="424" y="300" text-anchor="middle" font-size="20" font-weight="700" fill="#FFFFFF">2</text>
+    <rect x="350" y="164" width="235" height="168" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="374" y="204" font-size="19" font-weight="700" fill="#12355B">{{PHASE_2_TITLE}}</text>
+    <text x="374" y="240" font-size="14" fill="#64748B">重点项目 / 快速试点</text>
+    <text x="374" y="274" font-size="13" fill="#64748B">验证关键假设与投入产出</text>
+    <rect x="374" y="296" width="92" height="24" rx="12" fill="#EEF3FF"/>
+    <text x="420" y="313" text-anchor="middle" font-size="12" font-weight="700" fill="#2F6BFF">试点</text>
+
+    <circle cx="694" cy="292" r="26" fill="#2F6BFF"/>
+    <text x="694" y="300" text-anchor="middle" font-size="20" font-weight="700" fill="#FFFFFF">3</text>
+    <rect x="620" y="342" width="235" height="168" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="644" y="382" font-size="19" font-weight="700" fill="#12355B">{{PHASE_3_TITLE}}</text>
+    <text x="644" y="418" font-size="14" fill="#64748B">规模推广 / 机制固化</text>
+    <text x="644" y="452" font-size="13" fill="#64748B">纳入经营例会与绩效管理</text>
+    <rect x="644" y="474" width="92" height="24" rx="12" fill="#E6F7F4"/>
+    <text x="690" y="491" text-anchor="middle" font-size="12" font-weight="700" fill="#007C6B">推广</text>
+
+    <circle cx="964" cy="292" r="26" fill="#F59E0B"/>
+    <text x="964" y="300" text-anchor="middle" font-size="20" font-weight="700" fill="#FFFFFF">4</text>
+    <rect x="890" y="164" width="235" height="168" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="914" y="204" font-size="19" font-weight="700" fill="#12355B">{{PHASE_4_TITLE}}</text>
+    <text x="914" y="240" font-size="14" fill="#64748B">复盘优化 / 下一轮规划</text>
+    <text x="914" y="274" font-size="13" fill="#64748B">形成机制、能力与资源沉淀</text>
+    <rect x="914" y="296" width="92" height="24" rx="12" fill="#FFF7E6"/>
+    <text x="960" y="313" text-anchor="middle" font-size="12" font-weight="700" fill="#B66A00">复盘</text>
+  </g>
+
+  <rect x="80" y="554" width="1120" height="52" rx="8" fill="#12355B"/>
+  <text x="108" y="587" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="15" font-weight="700" fill="#00A88E">DECISION CHECKPOINT</text>
+  <text x="310" y="587" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="15" fill="#FFFFFF">每阶段结束后确认目标偏差、资源投入、组织协同与下一阶段授权。</text>
+
+  <text x="60" y="682" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" fill="#64748B">{{SECTION_NAME}}</text>
+  <rect x="1168" y="664" width="52" height="24" rx="12" fill="#12355B"/>
+  <text x="1194" y="681" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#FFFFFF">{{PAGE_NUM}}</text>
+</svg>

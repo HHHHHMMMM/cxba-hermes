@@ -1,0 +1,63 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#F7F9FC"/>
+  <rect x="0" y="0" width="1280" height="10" fill="#12355B"/>
+  <rect x="0" y="0" width="220" height="10" fill="#00A88E"/>
+
+  <text x="60" y="62" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="31" font-weight="700" fill="#12355B">{{PAGE_TITLE}}</text>
+  <rect x="60" y="84" width="1090" height="40" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+  <rect x="60" y="84" width="8" height="40" rx="4" fill="#00A88E"/>
+  <text x="84" y="110" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" font-weight="700" fill="#1F2937">{{KEY_MESSAGE}}</text>
+
+  <g id="kpi_metric_cards" font-family="Arial, 'Microsoft YaHei', sans-serif">
+    <rect x="60" y="152" width="268" height="160" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="84" y="188" font-size="13" font-weight="700" fill="#64748B">{{KPI_1_LABEL}}</text>
+    <text x="84" y="242" font-size="42" font-weight="700" fill="#12355B">{{KPI_1_VALUE}}</text>
+    <rect x="84" y="268" width="96" height="24" rx="12" fill="#E6F7F4"/>
+    <text x="132" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#007C6B">同比 / 环比</text>
+    <line x1="202" y1="280" x2="304" y2="252" stroke="#00A88E" stroke-width="3"/>
+
+    <rect x="356" y="152" width="268" height="160" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="380" y="188" font-size="13" font-weight="700" fill="#64748B">{{KPI_2_LABEL}}</text>
+    <text x="380" y="242" font-size="42" font-weight="700" fill="#12355B">{{KPI_2_VALUE}}</text>
+    <rect x="380" y="268" width="96" height="24" rx="12" fill="#EEF3FF"/>
+    <text x="428" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#2F6BFF">预算执行</text>
+    <line x1="498" y1="270" x2="600" y2="270" stroke="#2F6BFF" stroke-width="3"/>
+
+    <rect x="652" y="152" width="268" height="160" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="676" y="188" font-size="13" font-weight="700" fill="#64748B">{{KPI_3_LABEL}}</text>
+    <text x="676" y="242" font-size="42" font-weight="700" fill="#12355B">{{KPI_3_VALUE}}</text>
+    <rect x="676" y="268" width="96" height="24" rx="12" fill="#FFF7E6"/>
+    <text x="724" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#B66A00">需关注</text>
+    <line x1="794" y1="252" x2="896" y2="280" stroke="#F59E0B" stroke-width="3"/>
+
+    <rect x="948" y="152" width="272" height="160" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+    <text x="972" y="188" font-size="13" font-weight="700" fill="#64748B">{{KPI_4_LABEL}}</text>
+    <text x="972" y="242" font-size="42" font-weight="700" fill="#12355B">{{KPI_4_VALUE}}</text>
+    <rect x="972" y="268" width="96" height="24" rx="12" fill="#FEECEF"/>
+    <text x="1020" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#C03238">风险项</text>
+    <line x1="1090" y1="280" x2="1192" y2="242" stroke="#E5484D" stroke-width="3"/>
+  </g>
+
+  <rect x="60" y="340" width="560" height="250" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+  <text x="88" y="378" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="18" font-weight="700" fill="#12355B">经营洞察</text>
+  <rect x="88" y="402" width="504" height="1" fill="#D8E1EA"/>
+  <text x="88" y="448" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" fill="#64748B">填入收入、利润、现金流、交付效率等指标的结构化解释。</text>
+  <text x="88" y="486" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" fill="#64748B">建议采用“指标差距 - 根因 - 管理动作”的三段式表述。</text>
+  <rect x="88" y="528" width="152" height="32" rx="16" fill="#E6F7F4"/>
+  <text x="164" y="549" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#007C6B">行动闭环</text>
+
+  <rect x="660" y="340" width="560" height="250" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+  <text x="688" y="378" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="18" font-weight="700" fill="#12355B">风险与决策请求</text>
+  <rect x="688" y="402" width="504" height="1" fill="#D8E1EA"/>
+  <rect x="688" y="432" width="120" height="34" rx="6" fill="#FFF7E6"/>
+  <text x="748" y="455" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#B66A00">资源约束</text>
+  <rect x="828" y="432" width="120" height="34" rx="6" fill="#FEECEF"/>
+  <text x="888" y="455" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#C03238">进度风险</text>
+  <rect x="968" y="432" width="120" height="34" rx="6" fill="#EEF3FF"/>
+  <text x="1028" y="455" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#2F6BFF">机制优化</text>
+  <text x="688" y="514" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" fill="#64748B">在此放置需管理层拍板的资源、授权、机制或跨部门协同事项。</text>
+
+  <text x="60" y="682" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" fill="#64748B">{{SECTION_NAME}}</text>
+  <rect x="1168" y="664" width="52" height="24" rx="12" fill="#12355B"/>
+  <text x="1194" y="681" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#FFFFFF">{{PAGE_NUM}}</text>
+</svg>

@@ -1,0 +1,67 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#F7F9FC"/>
+  <rect x="0" y="0" width="1280" height="10" fill="#12355B"/>
+  <rect x="0" y="0" width="220" height="10" fill="#00A88E"/>
+
+  <text x="60" y="78" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="36" font-weight="700" fill="#12355B">目录</text>
+  <text x="60" y="112" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="16" fill="#64748B">经营分析议程与战略议题导航</text>
+
+  <rect x="60" y="152" width="690" height="470" rx="8" fill="#FFFFFF" stroke="#D8E1EA" stroke-width="1"/>
+  <line x1="116" y1="204" x2="116" y2="574" stroke="#D8E1EA" stroke-width="2"/>
+
+  <g id="toc_chapter_list" font-family="Arial, 'Microsoft YaHei', sans-serif">
+    <circle cx="116" cy="218" r="17" fill="#12355B"/>
+    <text x="116" y="224" text-anchor="middle" font-size="15" font-weight="700" fill="#FFFFFF">01</text>
+    <text x="158" y="225" font-size="23" font-weight="700" fill="#1F2937">{{TOC_ITEM_1_TITLE}}</text>
+    <text x="158" y="252" font-size="14" fill="#64748B">战略目标与年度经营假设</text>
+
+    <circle cx="116" cy="304" r="17" fill="#00A88E"/>
+    <text x="116" y="310" text-anchor="middle" font-size="15" font-weight="700" fill="#FFFFFF">02</text>
+    <text x="158" y="311" font-size="23" font-weight="700" fill="#1F2937">{{TOC_ITEM_2_TITLE}}</text>
+    <text x="158" y="338" font-size="14" fill="#64748B">核心 KPI、预算执行与资源效率</text>
+
+    <circle cx="116" cy="390" r="17" fill="#2F6BFF"/>
+    <text x="116" y="396" text-anchor="middle" font-size="15" font-weight="700" fill="#FFFFFF">03</text>
+    <text x="158" y="397" font-size="23" font-weight="700" fill="#1F2937">{{TOC_ITEM_3_TITLE}}</text>
+    <text x="158" y="424" font-size="14" fill="#64748B">市场机会、能力短板与竞争态势</text>
+
+    <circle cx="116" cy="476" r="17" fill="#F59E0B"/>
+    <text x="116" y="482" text-anchor="middle" font-size="15" font-weight="700" fill="#FFFFFF">04</text>
+    <text x="158" y="483" font-size="23" font-weight="700" fill="#1F2937">{{TOC_ITEM_4_TITLE}}</text>
+    <text x="158" y="510" font-size="14" fill="#64748B">重点举措、里程碑与组织协同</text>
+
+    <circle cx="116" cy="562" r="17" fill="#E5484D"/>
+    <text x="116" y="568" text-anchor="middle" font-size="15" font-weight="700" fill="#FFFFFF">05</text>
+    <text x="158" y="569" font-size="23" font-weight="700" fill="#1F2937">{{TOC_ITEM_5_TITLE}}</text>
+    <text x="158" y="596" font-size="14" fill="#64748B">风险预警、决策请求与下一步安排</text>
+  </g>
+
+  <rect x="790" y="152" width="430" height="470" rx="8" fill="#12355B"/>
+  <rect x="818" y="186" width="118" height="28" rx="14" fill="#E6F7F4"/>
+  <text x="877" y="205" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700" fill="#007C6B">EXECUTIVE VIEW</text>
+  <text x="818" y="260" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="700" fill="#FFFFFF">经营分析框架</text>
+  <text x="818" y="304" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="17" fill="#D8E1EA">从目标、绩效、问题、举措到决策请求，形成闭环汇报结构。</text>
+  <line x1="818" y1="342" x2="1168" y2="342" stroke="#2F6BFF" stroke-width="2"/>
+
+  <g id="executive_view_cards" font-family="Arial, 'Microsoft YaHei', sans-serif">
+    <rect x="818" y="382" width="156" height="86" rx="6" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.18"/>
+    <text x="840" y="419" font-size="30" font-weight="700" fill="#00A88E">1</text>
+    <text x="876" y="418" font-size="15" fill="#FFFFFF">目标对齐</text>
+    <text x="840" y="445" font-size="12" fill="#CBD5E1">战略假设与指标口径</text>
+
+    <rect x="1000" y="382" width="156" height="86" rx="6" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.18"/>
+    <text x="1022" y="419" font-size="30" font-weight="700" fill="#00A88E">2</text>
+    <text x="1058" y="418" font-size="15" fill="#FFFFFF">绩效拆解</text>
+    <text x="1022" y="445" font-size="12" fill="#CBD5E1">差距、原因与约束</text>
+
+    <rect x="818" y="494" width="156" height="86" rx="6" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.18"/>
+    <text x="840" y="531" font-size="30" font-weight="700" fill="#00A88E">3</text>
+    <text x="876" y="530" font-size="15" fill="#FFFFFF">行动闭环</text>
+    <text x="840" y="557" font-size="12" fill="#CBD5E1">举措、负责人、期限</text>
+
+    <rect x="1000" y="494" width="156" height="86" rx="6" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.18"/>
+    <text x="1022" y="531" font-size="30" font-weight="700" fill="#00A88E">4</text>
+    <text x="1058" y="530" font-size="15" fill="#FFFFFF">决策请求</text>
+    <text x="1022" y="557" font-size="12" fill="#CBD5E1">资源、机制与授权</text>
+  </g>
+</svg>

@@ -365,7 +365,7 @@ Skill 是流程和判断约束，不替代原件读取与确定性计算。若 S
   results/
   evidence-items/
   draft-report.md
-  hermes-case-report.md
+  case-investigation-report.md
 ```
 
 ### 8.4 失败时停止升级结论

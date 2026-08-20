@@ -355,7 +355,7 @@ def validate_final(workspace: Path) -> list[str]:
     state_path = workspace / "investigation-state.md"
     materials_path = workspace / "input" / "materials.json"
     claims_path = workspace / "evidence-items" / "final-claims.json"
-    report_path = workspace / "hermes-case-report.md"
+    report_path = workspace / "case-investigation-report.md"
     review_path = workspace / "review-result.md"
     required = (
         inventory_path,

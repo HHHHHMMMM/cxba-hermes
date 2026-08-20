@@ -1,0 +1,28 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#F7F9FC"/>
+  <rect x="0" y="0" width="1280" height="720" fill="#12355B"/>
+  <path d="M0,0 L430,0 L250,720 L0,720 Z" fill="#0C2744"/>
+  <rect x="0" y="0" width="1280" height="12" fill="#00A88E"/>
+  <rect x="1030" y="0" width="250" height="720" fill="#FFFFFF" fill-opacity="0.04"/>
+
+  <text x="118" y="214" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="132" font-weight="700" fill="#FFFFFF" fill-opacity="0.08">{{CHAPTER_NUM}}</text>
+  <rect x="118" y="286" width="110" height="110" rx="10" fill="#00A88E"/>
+  <text x="173" y="360" text-anchor="middle" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="46" font-weight="700" fill="#FFFFFF">{{CHAPTER_NUM}}</text>
+
+  <text x="292" y="326" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="48" font-weight="700" fill="#FFFFFF">{{CHAPTER_TITLE}}</text>
+  <rect x="292" y="356" width="380" height="5" rx="2.5" fill="#00A88E"/>
+  <rect x="688" y="356" width="122" height="5" rx="2.5" fill="#2F6BFF"/>
+  <text x="292" y="410" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="22" fill="#D8E1EA">{{CHAPTER_DESC}}</text>
+
+  <g id="chapter_focus_cards" font-family="Arial, 'Microsoft YaHei', sans-serif">
+    <rect x="292" y="486" width="240" height="74" rx="8" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.16"/>
+    <text x="316" y="520" font-size="15" font-weight="700" fill="#00A88E">ANALYSIS FOCUS</text>
+    <text x="316" y="546" font-size="14" fill="#CBD5E1">目标、差距、原因、行动</text>
+
+    <rect x="562" y="486" width="240" height="74" rx="8" fill="#FFFFFF" fill-opacity="0.08" stroke="#FFFFFF" stroke-opacity="0.16"/>
+    <text x="586" y="520" font-size="15" font-weight="700" fill="#00A88E">DECISION LENS</text>
+    <text x="586" y="546" font-size="14" fill="#CBD5E1">资源配置与管理取舍</text>
+  </g>
+
+  <text x="1188" y="654" text-anchor="end" font-family="Arial, 'Microsoft YaHei', sans-serif" font-size="14" fill="#CBD5E1">Company Strategy Operations Analysis</text>
+</svg>

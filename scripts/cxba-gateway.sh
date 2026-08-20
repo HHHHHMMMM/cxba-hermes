@@ -44,8 +44,9 @@ init_config() {
 		printf 'export CXBA_HERMES_GATEWAY_PRIVATE_TOKEN=%q\n' "${gateway_token}"
 		printf 'export CXBA_SPRING_MCP_TOKEN=%q\n' "${spring_mcp_token}"
 		printf 'export CXBA_MCP_CONNECTION_TOKEN=%q\n' "${spring_mcp_token}"
-		printf 'export CXBA_LOCAL_MODEL=%q\n' "${CXBA_LOCAL_MODEL:-qwen3.6-27b}"
-		printf 'export CXBA_LOCAL_MODEL_BASE_URL=%q\n' "${CXBA_LOCAL_MODEL_BASE_URL:-https://llm-gz2xserodo4c3kj6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
+		printf 'export CXBA_LOCAL_MODEL=%q\n' "${CXBA_LOCAL_MODEL:-qwen3.8-27b-nvfp4-72g-sim}"
+		printf 'export CXBA_LOCAL_MODEL_BASE_URL=%q\n' "${CXBA_LOCAL_MODEL_BASE_URL:-http://127.0.0.1:18080/v1}"
+		printf 'export CXBA_LOCAL_MODEL_CONTEXT_LENGTH=%q\n' "${CXBA_LOCAL_MODEL_CONTEXT_LENGTH:-131072}"
 		printf 'export CXBA_BAILIAN_API_KEY=%q\n' "${CXBA_BAILIAN_API_KEY:-}"
 		printf 'export CXBA_CASE_STORAGE_ROOT=%q\n' "${case_storage_root}"
 		printf 'export CXBA_KNOWLEDGE_VAULT_ROOT=%q\n' "${CXBA_KNOWLEDGE_VAULT_ROOT:-$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/knowledge-vault}"
@@ -104,6 +105,7 @@ inherit_gateway_environment() {
 		CXBA_SPRING_MCP_TOKEN \
 		CXBA_LOCAL_MODEL \
 		CXBA_LOCAL_MODEL_BASE_URL \
+		CXBA_LOCAL_MODEL_CONTEXT_LENGTH \
 		CXBA_BAILIAN_API_KEY \
 		CXBA_SILICONFLOW_API_KEY \
 		CXBA_CASE_STORAGE_ROOT \
@@ -138,12 +140,13 @@ prepare_environment() {
 	load_private_env_file
 	inherit_spring_tokens
 
-	: "${CXBA_LOCAL_MODEL:=qwen3.6-27b}"
-	: "${CXBA_LOCAL_MODEL_BASE_URL:=https://llm-gz2xserodo4c3kj6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
+	: "${CXBA_LOCAL_MODEL:=qwen3.8-27b-nvfp4-72g-sim}"
+	: "${CXBA_LOCAL_MODEL_BASE_URL:=http://127.0.0.1:18080/v1}"
+	: "${CXBA_LOCAL_MODEL_CONTEXT_LENGTH:=131072}"
 	: "${CXBA_CASE_STORAGE_ROOT:=$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/data/cxba}"
 	: "${CXBA_KNOWLEDGE_VAULT_ROOT:=$(cd "${PROJECT_DIR}/../cxba-workbench" && pwd)/knowledge-vault}"
 	: "${CXBA_SPRING_MCP_URL:=http://127.0.0.1:${SPRING_PORT}/mcp}"
-	export CXBA_LOCAL_MODEL CXBA_LOCAL_MODEL_BASE_URL CXBA_BAILIAN_API_KEY CXBA_SILICONFLOW_API_KEY CXBA_CASE_STORAGE_ROOT CXBA_KNOWLEDGE_VAULT_ROOT CXBA_SPRING_MCP_URL
+	export CXBA_LOCAL_MODEL CXBA_LOCAL_MODEL_BASE_URL CXBA_LOCAL_MODEL_CONTEXT_LENGTH CXBA_BAILIAN_API_KEY CXBA_SILICONFLOW_API_KEY CXBA_CASE_STORAGE_ROOT CXBA_KNOWLEDGE_VAULT_ROOT CXBA_SPRING_MCP_URL
 
 	local missing=()
 	[[ -n "${CXBA_GATEWAY_PRIVATE_TOKEN:-}" ]] || missing+=(CXBA_GATEWAY_PRIVATE_TOKEN)
@@ -167,6 +170,9 @@ is_bailian_model_endpoint() {
 }
 
 model_api_key() {
+	if [[ "${CXBA_LOCAL_MODEL_BASE_URL%/}" == "http://127.0.0.1:18080/v1" ]]; then
+		return
+	fi
 	if is_bailian_model_endpoint; then
 		printf '%s' "${CXBA_BAILIAN_API_KEY:-}"
 		return
@@ -247,7 +253,7 @@ start_gateway() {
 	# tmux only forwards a small allow-list from the calling shell. Keep values
 	# loaded from the private file, then explicitly carry the non-secret defaults
 	# prepared above so older config files also receive newly required roots.
-	gateway_command="set -a; source $(quote_shell "${ENV_FILE}"); set +a; export CXBA_LOCAL_MODEL=$(quote_shell "${CXBA_LOCAL_MODEL}") CXBA_LOCAL_MODEL_BASE_URL=$(quote_shell "${CXBA_LOCAL_MODEL_BASE_URL}") CXBA_CASE_STORAGE_ROOT=$(quote_shell "${CXBA_CASE_STORAGE_ROOT}") CXBA_KNOWLEDGE_VAULT_ROOT=$(quote_shell "${CXBA_KNOWLEDGE_VAULT_ROOT}") CXBA_SPRING_MCP_URL=$(quote_shell "${CXBA_SPRING_MCP_URL}"); exec $(quote_shell "${HERMES_BIN}") -p $(quote_shell "${PROFILE}") serve --host $(quote_shell "${HOST}") --port $(quote_shell "${PORT}") --isolated --skip-build >> $(quote_shell "${LOG_FILE}") 2>&1"
+	gateway_command="set -a; source $(quote_shell "${ENV_FILE}"); set +a; export CXBA_LOCAL_MODEL=$(quote_shell "${CXBA_LOCAL_MODEL}") CXBA_LOCAL_MODEL_BASE_URL=$(quote_shell "${CXBA_LOCAL_MODEL_BASE_URL}") CXBA_LOCAL_MODEL_CONTEXT_LENGTH=$(quote_shell "${CXBA_LOCAL_MODEL_CONTEXT_LENGTH}") CXBA_CASE_STORAGE_ROOT=$(quote_shell "${CXBA_CASE_STORAGE_ROOT}") CXBA_KNOWLEDGE_VAULT_ROOT=$(quote_shell "${CXBA_KNOWLEDGE_VAULT_ROOT}") CXBA_SPRING_MCP_URL=$(quote_shell "${CXBA_SPRING_MCP_URL}"); exec $(quote_shell "${HERMES_BIN}") -p $(quote_shell "${PROFILE}") serve --host $(quote_shell "${HOST}") --port $(quote_shell "${PORT}") --isolated --skip-build >> $(quote_shell "${LOG_FILE}") 2>&1"
 	tmux new-session -d -s "${TMUX_SESSION}" -c "${PROJECT_DIR}" "/bin/bash -lc $(quote_shell "${gateway_command}")"
 
 	local attempt

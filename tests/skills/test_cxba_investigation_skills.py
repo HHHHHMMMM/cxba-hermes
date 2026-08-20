@@ -16,6 +16,7 @@ SKILLS_ROOT = (
     / "skills"
     / "cxba"
 )
+PRODUCTION_SKILLS_ROOT = SKILLS_ROOT.parent
 SKILL_NAMES = (
     "cxba-case-investigation",
     "cxba-case-investigator",
@@ -57,6 +58,34 @@ def test_case_skills_use_minimal_frontmatter() -> None:
         }
         assert frontmatter["description"].strip()
         assert body.strip()
+
+
+def test_generated_artifact_names_do_not_expose_runtime_brand() -> None:
+    artifact_pattern = re.compile(
+        r"(?i)(?P<path>[A-Za-z0-9_./-]*hermes[A-Za-z0-9_./-]*\."
+        r"(?:md|docx|xlsx|xls|csv|pdf|pptx|json|html|txt|png|jpg|jpeg))"
+    )
+    violations: list[str] = []
+    for path in PRODUCTION_SKILLS_ROOT.rglob("*"):
+        if path.suffix.lower() not in {".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in artifact_pattern.finditer(text):
+            candidate = match.group("path")
+            if "/.hermes/" in candidate:
+                continue
+            violations.append(f"{path.relative_to(PRODUCTION_SKILLS_ROOT)}: {candidate}")
+    assert violations == []
+
+
+def test_full_case_report_uses_neutral_artifact_name() -> None:
+    investigator = parse_skill("cxba-case-investigator")[1]
+    gate = FINAL_GATE.read_text(encoding="utf-8")
+
+    assert "case-investigation-report.md" in investigator
+    assert "case-investigation-report.md" in gate
+    assert "hermes-case-report.md" not in investigator
+    assert "hermes-case-report.md" not in gate
 
 
 def test_focused_questions_route_away_from_full_case_investigation() -> None:
@@ -1478,7 +1507,7 @@ Excel原始行/唯一流水：原始行2、3；柜员流水号T1、T2
     (workspace / "evidence-items" / "final-claims.json").write_text(
         json.dumps(claims, ensure_ascii=False), encoding="utf-8"
     )
-    (workspace / "hermes-case-report.md").write_text(
+    (workspace / "case-investigation-report.md").write_text(
         "# 调查报告\n\n经计算，2笔，合计20万元，已按强流水完成镜像去重 [C001]\n",
         encoding="utf-8",
     )
@@ -1580,7 +1609,7 @@ def test_final_gate_rejects_zero_byte_report_and_empty_claims(tmp_path: Path) ->
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _write_final_gate_workspace(workspace)
-    (workspace / "hermes-case-report.md").write_text("", encoding="utf-8")
+    (workspace / "case-investigation-report.md").write_text("", encoding="utf-8")
     (workspace / "evidence-items" / "final-claims.json").write_text(
         json.dumps({"claims": []}), encoding="utf-8"
     )

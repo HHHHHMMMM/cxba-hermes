@@ -12,6 +12,7 @@ RUN apt-get update \
         file \
         fonts-noto-cjk \
         jq \
+        libcairo2 \
         libreoffice-nogui \
         nodejs \
         p7zip-full \
